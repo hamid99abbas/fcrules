@@ -1,0 +1,23 @@
+{
+  "total_chunks": 119,
+  "chunks_per_law": {
+    "Law 01 - The Field of Play": 14,
+    "Law 02 - The Ball": 3,
+    "Law 03 - The Players": 10,
+    "Law 04 - The Players’ Equipment": 6,
+    "Law 05 - The Referee": 7,
+    "Law 06 - The Other Match Officials": 7,
+    "Law 07 - The Duration of the Match": 5,
+    "Law 08 - The Start and Restart of Play": 2,
+    "Law 09 - The Ball in and out of Play": 2,
+    "Law 10 - Determining the Outcome of a Match": 3,
+    "Law 11 - Offside": 4,
+    "Law 12 - Fouls and Misconduct": 5,
+    "Law 13 - Free Kicks": 3,
+    "Law 14 - The Penalty Kick": 3,
+    "Law 15 - The Throw-in": 2,
+    "Law 16 - The Goal Kick": 2,
+    "Law 17 - The Corner Kick": 41
+  },
+  "output_jsonl": "rag_chunks\\chunks.jsonl"
+}

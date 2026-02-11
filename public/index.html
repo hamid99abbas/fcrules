@@ -1,0 +1,1271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FootballLaw — Laws of the Game AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,600;1,9..40,300&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    /* ─── RESET & BASE ─────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --pitch-dark:   #0a1a0e;
+      --pitch-mid:    #0f2614;
+      --pitch-light:  #14321a;
+      --line-white:   #e8f5ea;
+      --stripe-a:     #0f2614;
+      --stripe-b:     #112c17;
+      --grass-glow:   rgba(34, 197, 94, 0.07);
+      --lime:         #84cc16;
+      --lime-bright:  #a3e635;
+      --amber:        #f59e0b;
+      --red-card:     #ef4444;
+      --yellow-card:  #eab308;
+      --white-70:     rgba(232,245,234,0.7);
+      --white-40:     rgba(232,245,234,0.4);
+      --white-15:     rgba(232,245,234,0.15);
+      --white-08:     rgba(232,245,234,0.08);
+      --border:       rgba(232,245,234,0.12);
+      --shadow-lg:    0 20px 60px rgba(0,0,0,0.6);
+      --r-sm: 6px;
+      --r-md: 12px;
+      --r-lg: 20px;
+      --font-display: 'Bebas Neue', sans-serif;
+      --font-body:    'DM Sans', sans-serif;
+      --font-mono:    'JetBrains Mono', monospace;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-body);
+      background-color: var(--pitch-dark);
+      color: var(--line-white);
+      min-height: 100vh;
+      overflow-x: hidden;
+      cursor: default;
+      font-size: 16px;
+    }
+
+    /* ─── PITCH STRIPE BACKGROUND ──────────────────────────────── */
+    .pitch-bg {
+      position: fixed; inset: 0; z-index: 0;
+      background-image: repeating-linear-gradient(
+        180deg,
+        var(--stripe-a) 0px, var(--stripe-a) 60px,
+        var(--stripe-b) 60px, var(--stripe-b) 120px
+      );
+      opacity: 0.6;
+    }
+
+    /* radial spotlight overlay */
+    .pitch-bg::after {
+      content: '';
+      position: absolute; inset: 0;
+      background: radial-gradient(ellipse 80% 60% at 50% 30%,
+        rgba(34,197,94,0.08) 0%,
+        rgba(10,26,14,0.0) 60%,
+        rgba(10,26,14,0.7) 100%
+      );
+    }
+
+    /* pitch lines watermark */
+    .pitch-lines {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      opacity: 0.04;
+      background-image:
+        linear-gradient(var(--line-white) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line-white) 1px, transparent 1px);
+      background-size: 80px 80px;
+    }
+
+    /* ─── NOISE GRAIN ───────────────────────────────────────────── */
+    .grain {
+      position: fixed; inset: 0; z-index: 999; pointer-events: none;
+      opacity: 0.025;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+    }
+
+    /* ─── LAYOUT ─────────────────────────────────────────────────── */
+    .app {
+      position: relative; z-index: 1;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 100vh;
+    }
+
+    /* ─── HERO / HEADER ─────────────────────────────────────────── */
+    .hero {
+      padding: 48px 24px 32px;
+      text-align: center;
+      animation: fadeDown 0.7s ease both;
+    }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 6px 16px;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--lime);
+      margin-bottom: 20px;
+      font-family: var(--font-mono);
+    }
+
+    .badge-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--lime);
+      animation: pulse 1.8s ease infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.8); }
+    }
+
+    h1 {
+      font-family: var(--font-display);
+      font-size: clamp(52px, 10vw, 96px);
+      line-height: 0.9;
+      letter-spacing: 0.03em;
+      color: var(--line-white);
+      margin-bottom: 4px;
+    }
+
+    h1 span.accent {
+      color: var(--lime-bright);
+      text-shadow: 0 0 40px rgba(163,230,53,0.4);
+    }
+
+    .hero-sub {
+      font-size: 15px;
+      color: var(--white-70);
+      font-weight: 300;
+      margin-top: 12px;
+      letter-spacing: 0.02em;
+    }
+
+    /* ─── STATS ROW ─────────────────────────────────────────────── */
+    .stats-row {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      flex-wrap: wrap;
+      margin-top: 28px;
+      animation: fadeDown 0.9s ease both;
+    }
+
+    .stat {
+      display: flex; flex-direction: column; align-items: center; gap: 2px;
+    }
+
+    .stat-val {
+      font-family: var(--font-display);
+      font-size: 28px;
+      color: var(--line-white);
+      letter-spacing: 0.04em;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--white-40);
+      font-family: var(--font-mono);
+    }
+
+    /* ─── MAIN CHAT AREA ────────────────────────────────────────── */
+    .chat-wrapper {
+      max-width: 900px;
+      margin: 0 auto;
+      width: 100%;
+      padding: 0 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      animation: fadeUp 0.7s ease both;
+    }
+
+    /* ─── PITCH DIVIDER ─────────────────────────────────────────── */
+    .pitch-divider {
+      display: flex; align-items: center; gap: 16px;
+      margin-bottom: 24px;
+      animation: fadeUp 0.8s 0.1s ease both;
+      opacity: 0; animation-fill-mode: forwards;
+    }
+
+    .pitch-divider::before,
+    .pitch-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border), transparent);
+    }
+
+    .pitch-divider span {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--white-40);
+    }
+
+    /* ─── MESSAGES ──────────────────────────────────────────────── */
+    .messages {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-height: 320px;
+      max-height: 52vh;
+      overflow-y: auto;
+      padding: 4px 2px 16px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--white-15) transparent;
+    }
+
+    .messages::-webkit-scrollbar { width: 4px; }
+    .messages::-webkit-scrollbar-track { background: transparent; }
+    .messages::-webkit-scrollbar-thumb { background: var(--white-15); border-radius: 99px; }
+
+    /* empty state */
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 24px;
+      gap: 32px;
+    }
+
+    .ball-icon {
+      width: 64px; height: 64px;
+      opacity: 0.15;
+      animation: spin 12s linear infinite;
+    }
+
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+    .empty-state p {
+      font-size: 14px;
+      color: var(--white-40);
+      text-align: center;
+      max-width: 340px;
+      line-height: 1.7;
+      font-style: italic;
+    }
+
+    /* suggested questions */
+    .suggestions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+      max-width: 600px;
+    }
+
+    .suggestion-btn {
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 8px 18px;
+      font-size: 12px;
+      color: var(--white-70);
+      font-family: var(--font-body);
+      cursor: pointer;
+      transition: all 0.2s;
+      line-height: 1.4;
+    }
+
+    .suggestion-btn:hover {
+      background: var(--white-15);
+      border-color: rgba(132,204,22,0.3);
+      color: var(--lime-bright);
+      transform: translateY(-1px);
+    }
+
+    /* message bubbles */
+    .msg {
+      display: flex;
+      gap: 14px;
+      animation: fadeUp 0.35s ease both;
+    }
+
+    .msg.user { flex-direction: row-reverse; }
+
+    .msg-avatar {
+      width: 34px; height: 34px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+
+    .msg.user .msg-avatar {
+      background: linear-gradient(135deg, var(--lime) 0%, #16a34a 100%);
+      color: var(--pitch-dark);
+      font-family: var(--font-display);
+      letter-spacing: 0.05em;
+    }
+
+    .msg.ai .msg-avatar {
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      color: var(--lime);
+      font-family: var(--font-display);
+    }
+
+    .msg-body { flex: 1; max-width: calc(100% - 48px); }
+
+    .msg.user .msg-body { align-items: flex-end; display: flex; flex-direction: column; }
+
+    .msg-bubble {
+      border-radius: var(--r-lg);
+      padding: 14px 18px;
+      font-size: 14px;
+      line-height: 1.65;
+      max-width: 90%;
+    }
+
+    .msg.user .msg-bubble {
+      background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
+      color: white;
+      border-bottom-right-radius: var(--r-sm);
+    }
+
+    .msg.ai .msg-bubble {
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      color: var(--line-white);
+      border-bottom-left-radius: var(--r-sm);
+      backdrop-filter: blur(12px);
+    }
+
+    .msg-meta {
+      font-size: 10px;
+      color: var(--white-40);
+      margin-top: 6px;
+      font-family: var(--font-mono);
+      display: flex; align-items: center; gap: 8px;
+    }
+
+    .msg.ai .msg-meta { padding-left: 2px; }
+    .msg.user .msg-meta { padding-right: 2px; flex-direction: row-reverse; }
+
+    /* ─── AI ANSWER FORMATTING ──────────────────────────────────── */
+    .ai-answer { white-space: pre-wrap; }
+
+    .ai-answer .law-tag {
+      display: inline-block;
+      background: rgba(132,204,22,0.12);
+      border: 1px solid rgba(132,204,22,0.25);
+      color: var(--lime-bright);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-right: 6px;
+      text-transform: uppercase;
+    }
+
+    /* ─── EVIDENCE ACCORDION ────────────────────────────────────── */
+    .evidence-toggle {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11px;
+      color: var(--lime);
+      font-family: var(--font-mono);
+      cursor: pointer;
+      background: none; border: none;
+      padding: 0;
+      margin-top: 10px;
+      transition: opacity 0.2s;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .evidence-toggle:hover { opacity: 0.7; }
+
+    .evidence-toggle .chevron {
+      transition: transform 0.25s;
+      font-size: 10px;
+    }
+
+    .evidence-toggle.open .chevron { transform: rotate(180deg); }
+
+    .evidence-panel {
+      margin-top: 10px;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .evidence-panel.open { display: flex; }
+
+    .evidence-item {
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-left: 2px solid rgba(132,204,22,0.35);
+      border-radius: var(--r-sm);
+      padding: 10px 14px;
+    }
+
+    .evidence-cite {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--lime);
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+
+    .evidence-text {
+      font-size: 12px;
+      color: var(--white-70);
+      line-height: 1.6;
+    }
+
+    /* ─── TYPING INDICATOR ──────────────────────────────────────── */
+    .typing-indicator {
+      display: flex; align-items: center; gap: 5px;
+      padding: 14px 18px;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      border-bottom-left-radius: var(--r-sm);
+      width: fit-content;
+      backdrop-filter: blur(12px);
+    }
+
+    .typing-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--lime);
+      animation: typing-bounce 1.2s ease infinite;
+    }
+
+    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+    @keyframes typing-bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-6px); opacity: 1; }
+    }
+
+    /* ─── INPUT AREA ────────────────────────────────────────────── */
+    .input-area {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-top: 8px;
+    }
+
+    .input-shell {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      padding: 12px 14px;
+      transition: border-color 0.25s, box-shadow 0.25s;
+      backdrop-filter: blur(16px);
+    }
+
+    .input-shell:focus-within {
+      border-color: rgba(132,204,22,0.4);
+      box-shadow: 0 0 0 3px rgba(132,204,22,0.07), 0 8px 32px rgba(0,0,0,0.3);
+    }
+
+    #question-input {
+      flex: 1;
+      background: none; border: none; outline: none;
+      color: var(--line-white);
+      font-family: var(--font-body);
+      font-size: 14px;
+      line-height: 1.6;
+      resize: none;
+      min-height: 22px;
+      max-height: 120px;
+      overflow-y: auto;
+      scrollbar-width: none;
+    }
+
+    #question-input::-webkit-scrollbar { display: none; }
+
+    #question-input::placeholder { color: var(--white-40); }
+
+    .send-btn {
+      width: 38px; height: 38px; flex-shrink: 0;
+      background: linear-gradient(135deg, var(--lime) 0%, #16a34a 100%);
+      border: none; border-radius: 50%;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: transform 0.2s, box-shadow 0.2s, opacity 0.2s;
+      color: var(--pitch-dark);
+    }
+
+    .send-btn:hover { transform: scale(1.07); box-shadow: 0 4px 20px rgba(132,204,22,0.4); }
+    .send-btn:active { transform: scale(0.95); }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    .input-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 2px;
+    }
+
+    .input-hint {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--white-40);
+      letter-spacing: 0.08em;
+    }
+
+    .kbd {
+      display: inline-block;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-size: 9px;
+    }
+
+    /* ─── SETTINGS PANEL ────────────────────────────────────────── */
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .setting-chip {
+      display: flex; align-items: center; gap: 7px;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 5px 12px;
+      font-size: 11px;
+      color: var(--white-70);
+      font-family: var(--font-mono);
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s;
+      letter-spacing: 0.05em;
+    }
+
+    .setting-chip:hover { border-color: var(--border); background: var(--white-15); }
+    .setting-chip.active { border-color: rgba(132,204,22,0.4); color: var(--lime-bright); background: rgba(132,204,22,0.08); }
+
+    .setting-chip-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--white-40);
+      transition: background 0.2s;
+    }
+
+    .setting-chip.active .setting-chip-dot { background: var(--lime); }
+
+    /* api url input */
+    .api-input-wrap {
+      flex: 1; min-width: 200px;
+      display: flex; align-items: center; gap: 8px;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 5px 14px;
+    }
+
+    .api-input-wrap label {
+      font-size: 10px;
+      font-family: var(--font-mono);
+      color: var(--white-40);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    #api-url-input {
+      flex: 1;
+      background: none; border: none; outline: none;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--lime);
+      min-width: 0;
+    }
+
+    /* ─── FOOTER ────────────────────────────────────────────────── */
+    footer {
+      padding: 0 24px 28px;
+      margin-top: 16px;
+    }
+
+    .footer-rule {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border), var(--border), transparent);
+      margin-bottom: 20px;
+    }
+
+    .footer-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    .footer-copy {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--white-40);
+      letter-spacing: 0.08em;
+    }
+
+    .footer-copy a {
+      color: var(--white-40);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .footer-copy a:hover { color: var(--white-70); }
+
+    .footer-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      transition: opacity 0.2s;
+    }
+    .footer-brand:hover { opacity: 0.75; }
+
+    .footer-brand-label {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 1px;
+    }
+
+    .footer-brand-built {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--white-40);
+    }
+
+    .footer-brand-name {
+      font-family: var(--font-display);
+      font-size: 15px;
+      letter-spacing: 0.06em;
+      color: var(--line-white);
+      line-height: 1;
+    }
+
+    .footer-brand-mark {
+      width: 28px; height: 28px;
+      border-radius: 6px;
+      background: var(--white-08);
+      border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-family: var(--font-display);
+      font-size: 13px;
+      color: var(--lime);
+      letter-spacing: 0.04em;
+      flex-shrink: 0;
+    }
+
+    /* ─── TOAST ─────────────────────────────────────────────────── */
+    .toast {
+      position: fixed;
+      bottom: 24px; right: 24px;
+      background: var(--pitch-light);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      padding: 12px 18px;
+      font-size: 13px;
+      color: var(--line-white);
+      z-index: 1000;
+      transform: translateY(80px);
+      opacity: 0;
+      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+      max-width: 320px;
+      backdrop-filter: blur(16px);
+    }
+
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.error { border-color: rgba(239,68,68,0.4); }
+
+    /* ─── ANIMATIONS ────────────────────────────────────────────── */
+    @keyframes fadeDown {
+      from { opacity: 0; transform: translateY(-16px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(16px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ─── SCROLLBAR FOR MESSAGES ────────────────────────────────── */
+    .messages { scroll-behavior: smooth; }
+
+    /* ─── PROCESSING TIME BADGE ─────────────────────────────────── */
+    .perf-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--white-40);
+    }
+
+    .perf-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--lime); opacity: 0.6; }
+
+    /* ─── STAT COUNTER BUMP ─────────────────────────────────────── */
+    @keyframes statBump {
+      0%   { transform: scale(1);    color: var(--line-white); }
+      40%  { transform: scale(1.3);  color: var(--lime-bright); text-shadow: 0 0 16px rgba(163,230,53,0.7); }
+      100% { transform: scale(1);    color: var(--line-white); }
+    }
+    .stat-bump { animation: statBump 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+
+    /* ─── MOBILE ────────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      /* hero */
+      .hero { padding: 28px 16px 16px; }
+      h1 { font-size: clamp(48px, 18vw, 72px); }
+      .hero-sub { font-size: 13px; padding: 0 8px; }
+
+      /* stats */
+      .stats-row { gap: 16px 24px; }
+      .stat-val { font-size: 22px; }
+      .stat-label { font-size: 9px; }
+
+      /* chat */
+      .chat-wrapper { padding: 0 12px 16px; }
+      .messages { max-height: 46vh; min-height: 200px; }
+
+      /* bubbles */
+      .msg-bubble { font-size: 13px; padding: 12px 14px; max-width: 100%; }
+      .msg-avatar { width: 28px; height: 28px; font-size: 11px; }
+
+      /* input */
+      .input-shell { padding: 10px 12px; border-radius: 14px; }
+      #question-input { font-size: 14px; }
+      .send-btn { width: 34px; height: 34px; }
+
+      /* settings row — stack on small screens */
+      .settings-row { flex-direction: column; align-items: stretch; gap: 8px; }
+      .api-input-wrap { min-width: unset; }
+      .input-footer { flex-direction: column; align-items: flex-start; gap: 8px; }
+      .input-hint { align-self: flex-end; }
+
+      /* footer */
+      .footer-inner { flex-direction: column; align-items: center; text-align: center; gap: 14px; }
+      .footer-brand-label { align-items: center; }
+
+      /* hide corner flags on tiny screens */
+      .corner-flag { display: none; }
+
+      /* pitch arc — shrink */
+      .pitch-arc { width: 360px; height: 200px; bottom: -100px; }
+    }
+
+    /* ─── SMALL TABLET ──────────────────────────────────────────── */
+    @media (min-width: 641px) and (max-width: 900px) {
+      .chat-wrapper { padding: 0 20px 20px; }
+      .messages { max-height: 48vh; }
+      .settings-row { flex-wrap: wrap; }
+    }
+
+    /* ─── PITCH HALF-CIRCLE DECORATION ─────────────────────────── */
+    .pitch-arc {
+      position: fixed;
+      bottom: -200px; left: 50%;
+      transform: translateX(-50%);
+      width: 700px; height: 400px;
+      border: 1px solid rgba(232,245,234,0.04);
+      border-radius: 50%;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ─── CORNER FLAG ───────────────────────────────────────────── */
+    .corner-flag {
+      position: fixed;
+      z-index: 0;
+      opacity: 0.06;
+      pointer-events: none;
+    }
+    .corner-flag.tl { top: 0; left: 0; }
+    .corner-flag.tr { top: 0; right: 0; }
+
+    .corner-flag svg { width: 120px; height: 120px; }
+  </style>
+</head>
+<body>
+
+  <!-- decorative pitch elements -->
+  <div class="pitch-bg"></div>
+  <div class="pitch-lines"></div>
+  <div class="grain"></div>
+  <div class="pitch-arc"></div>
+
+  <!-- corner flag decorations -->
+  <div class="corner-flag tl">
+    <svg viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M0 0 L80 0 L80 4 L4 4 L4 80 L0 80 Z" fill="white"/>
+      <circle cx="4" cy="4" r="20" stroke="white" stroke-width="1.5" fill="none"/>
+    </svg>
+  </div>
+  <div class="corner-flag tr" style="transform: scaleX(-1)">
+    <svg viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M0 0 L80 0 L80 4 L4 4 L4 80 L0 80 Z" fill="white"/>
+      <circle cx="4" cy="4" r="20" stroke="white" stroke-width="1.5" fill="none"/>
+    </svg>
+  </div>
+
+  <div class="app">
+
+    <!-- HERO -->
+    <header class="hero">
+      <div class="badge">
+        <div class="badge-dot"></div>
+        <span>AI-Powered · Official IFAB Rules · Always Accurate</span>
+      </div>
+      <h1>FOOTBALL<br><span class="accent">LAW</span></h1>
+      <p class="hero-sub">Ask any question about the Laws of the Game — powered by AI &amp; official IFAB rules</p>
+
+      <div class="stats-row" id="stats-row">
+        <div class="stat">
+          <span class="stat-val" id="stat-session">0</span>
+          <span class="stat-label">Asked This Session</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" id="stat-laws">—</span>
+          <span class="stat-label">Laws Covered</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" id="stat-queries">—</span>
+          <span class="stat-label">All-Time Questions</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val">✓</span>
+          <span class="stat-label">Instant Answers</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- MAIN CHAT -->
+    <main class="chat-wrapper">
+
+      <div class="pitch-divider">
+        <span>KICK OFF</span>
+      </div>
+
+      <!-- messages -->
+      <div class="messages" id="messages">
+        <!-- empty state -->
+        <div class="empty-state" id="empty-state">
+          <svg class="ball-icon" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="32" cy="32" r="30" stroke="white" stroke-width="2"/>
+            <path d="M32 2 L32 12 M32 52 L32 62 M2 32 L12 32 M52 32 L62 32" stroke="white" stroke-width="1.5"/>
+            <circle cx="32" cy="32" r="8" fill="white"/>
+            <path d="M32 2 C20 8 16 20 22 32 C16 44 20 56 32 62 C44 56 48 44 42 32 C48 20 44 8 32 2Z" stroke="white" stroke-width="1.5" fill="none"/>
+          </svg>
+          <p>No questions yet. Ask about offside, handball, penalties, red cards, restarts — anything from the Laws of the Game.</p>
+          <div class="suggestions" id="suggestions">
+            <button class="suggestion-btn" onclick="useSuggestion(this)">What is the handball rule?</button>
+            <button class="suggestion-btn" onclick="useSuggestion(this)">When is a penalty awarded?</button>
+            <button class="suggestion-btn" onclick="useSuggestion(this)">Can a goalkeeper score from a goal kick?</button>
+            <button class="suggestion-btn" onclick="useSuggestion(this)">What counts as offside?</button>
+            <button class="suggestion-btn" onclick="useSuggestion(this)">When is a dropped ball used?</button>
+            <button class="suggestion-btn" onclick="useSuggestion(this)">What is a red card offence?</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- input -->
+      <div class="input-area">
+        <div class="input-shell">
+          <textarea
+            id="question-input"
+            placeholder="Ask about any football law…"
+            rows="1"
+            onkeydown="handleKeyDown(event)"
+            oninput="autoResize(this)"
+          ></textarea>
+          <button class="send-btn" id="send-btn" onclick="sendQuestion()" title="Send (Enter)">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M14.5 8L1.5 1.5L4 8L1.5 14.5L14.5 8Z"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="input-footer">
+          <div class="settings-row">
+            <div class="api-input-wrap">
+              <label>API</label>
+              <input type="text" id="api-url-input" value="http://localhost:8000" placeholder="http://localhost:8000" />
+            </div>
+            <div class="setting-chip" id="chip-evidence" onclick="toggleChip(this)">
+              <div class="setting-chip-dot"></div>
+              <span>Show Evidence</span>
+            </div>
+            <div class="setting-chip" id="chip-raw" onclick="toggleChip(this)">
+              <div class="setting-chip-dot"></div>
+              <span>Raw Chunks</span>
+            </div>
+          </div>
+          <div class="input-hint">
+            <span class="kbd">Enter</span> send &nbsp; <span class="kbd">Shift+Enter</span> newline
+          </div>
+        </div>
+      </div>
+
+    </main>
+
+    <footer>
+      <div class="footer-rule"></div>
+      <div class="footer-inner">
+        <div class="footer-copy">
+          FootballLaw AI &nbsp;·&nbsp; <a href="https://www.theifab.com/laws-edition/2024-25/guidelines-and-notes/guidelines-for-match-officials/" target="_blank" rel="noopener">IFAB Laws of the Game</a> &nbsp;·&nbsp; RAG v2.0
+        </div>
+        <a class="footer-brand" href="https://firswoodintelligence.com" target="_blank" rel="noopener" title="Visit Firswood Intelligence">
+          <div class="footer-brand-label">
+            <span class="footer-brand-built">Built by</span>
+            <span class="footer-brand-name">FIRSWOOD INTELLIGENCE</span>
+          </div>
+          <div class="footer-brand-mark">FI</div>
+        </a>
+      </div>
+    </footer>
+  </div>
+
+  <!-- toast -->
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ─── STATE ────────────────────────────────────────────────────
+    let isLoading = false;
+    let showEvidence = false;
+    let includeRawChunks = false;
+    let sessionQuestions = 0;
+    const API_BASE = () => document.getElementById('api-url-input').value.replace(/\/$/, '');
+
+    // ─── BOOT ─────────────────────────────────────────────────────
+    window.addEventListener('DOMContentLoaded', () => {
+      fetchStats();
+      autoResize(document.getElementById('question-input'));
+    });
+
+    async function fetchStats() {
+      try {
+        const r = await fetch(`${API_BASE()}/stats`, { signal: AbortSignal.timeout(4000) });
+        if (!r.ok) return;
+        const d = await r.json();
+        document.getElementById('stat-laws').textContent = d.unique_laws?.length ?? '—';
+
+        // Prefer all_time_queries (persistent) — fall back to total_queries_processed
+        const allTime = d.all_time_queries ?? d.total_queries_processed ?? null;
+        if (allTime !== null) {
+          animateCounter('stat-queries', allTime);
+        }
+      } catch (_) {
+        // API not connected — stat-queries stays as '—'
+      }
+    }
+
+    // Animated count-up for the all-time stat
+    function animateCounter(id, target) {
+      const el = document.getElementById(id);
+      const current = parseInt(el.textContent.replace(/,/g, '')) || 0;
+      if (current === target) { el.textContent = target.toLocaleString(); return; }
+      const duration = 900;
+      const start = performance.now();
+      const from = current;
+      function tick(now) {
+        const p = Math.min((now - start) / duration, 1);
+        // ease-out cubic
+        const eased = 1 - Math.pow(1 - p, 3);
+        const val = Math.round(from + (target - from) * eased);
+        el.textContent = val.toLocaleString();
+        if (p < 1) requestAnimationFrame(tick);
+        else el.textContent = target.toLocaleString();
+      }
+      requestAnimationFrame(tick);
+    }
+
+    function incrementSessionCounter() {
+      sessionQuestions++;
+      const el = document.getElementById('stat-session');
+      el.textContent = sessionQuestions.toLocaleString();
+      el.classList.remove('stat-bump');
+      void el.offsetWidth;
+      el.classList.add('stat-bump');
+    }
+
+    // ─── TOGGLE CHIPS ─────────────────────────────────────────────
+    function toggleChip(el) {
+      el.classList.toggle('active');
+      if (el.id === 'chip-evidence') showEvidence = el.classList.contains('active');
+      if (el.id === 'chip-raw') includeRawChunks = el.classList.contains('active');
+    }
+
+    // ─── SUGGESTION ───────────────────────────────────────────────
+    function useSuggestion(btn) {
+      const input = document.getElementById('question-input');
+      input.value = btn.textContent;
+      autoResize(input);
+      sendQuestion();
+    }
+
+    // ─── INPUT HELPERS ────────────────────────────────────────────
+    function autoResize(el) {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+    }
+
+    function handleKeyDown(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendQuestion();
+      }
+    }
+
+    // ─── SEND QUESTION ────────────────────────────────────────────
+    async function sendQuestion() {
+      if (isLoading) return;
+      const input = document.getElementById('question-input');
+      const question = input.value.trim();
+      if (!question) return;
+
+      // hide empty state
+      document.getElementById('empty-state')?.remove();
+
+      // clear input
+      input.value = '';
+      autoResize(input);
+
+      // add user bubble
+      addMessage('user', question);
+      incrementSessionCounter();
+      setLoading(true);
+
+      // show typing indicator
+      const typingId = addTyping();
+
+      try {
+        const res = await fetch(`${API_BASE()}/ask`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question,
+            top_k: 10,
+            include_raw_chunks: includeRawChunks
+          })
+        });
+
+        removeTyping(typingId);
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+          throw new Error(err.detail || 'API error');
+        }
+
+        const data = await res.json();
+        addAIMessage(data);
+        fetchStats(); // refresh Total Answered from API
+
+      } catch (err) {
+        removeTyping(typingId);
+        addMessage('error', `⚠️ ${err.message || 'Could not connect to API.'}`);
+        showToast('Error: ' + (err.message || 'Could not reach API'), true);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    // ─── BUILD USER BUBBLE ────────────────────────────────────────
+    function addMessage(type, text) {
+      const messages = document.getElementById('messages');
+      const wrap = document.createElement('div');
+      wrap.className = `msg ${type === 'user' ? 'user' : 'ai'}`;
+
+      const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      if (type === 'user') {
+        wrap.innerHTML = `
+          <div class="msg-avatar">YOU</div>
+          <div class="msg-body">
+            <div class="msg-bubble">${escHtml(text)}</div>
+            <div class="msg-meta">${now}</div>
+          </div>`;
+      } else {
+        wrap.innerHTML = `
+          <div class="msg-avatar">⚽</div>
+          <div class="msg-body">
+            <div class="msg-bubble" style="color: var(--red-card)">${escHtml(text)}</div>
+            <div class="msg-meta">${now}</div>
+          </div>`;
+      }
+      messages.appendChild(wrap);
+      scrollBottom();
+    }
+
+    // ─── BUILD AI RESPONSE BUBBLE ─────────────────────────────────
+    function addAIMessage(data) {
+      const messages = document.getElementById('messages');
+      const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const ms = data.processing_time_ms ? Math.round(data.processing_time_ms) : null;
+
+      // format the answer text
+      const formattedAnswer = formatAnswer(data.answer);
+
+      // build evidence html
+      let evidenceHtml = '';
+      if (showEvidence && data.evidence && data.evidence.length > 0) {
+        const items = data.evidence.slice(0, 5).map(e => `
+          <div class="evidence-item">
+            <div class="evidence-cite">${escHtml(e.citation)}</div>
+            <div class="evidence-text">${escHtml(e.text_preview)}</div>
+            ${e.full_text ? `<div class="evidence-text" style="margin-top:6px;opacity:0.6;font-size:11px">${escHtml(e.full_text.slice(0, 400))}…</div>` : ''}
+          </div>
+        `).join('');
+
+        evidenceHtml = `
+          <button class="evidence-toggle" onclick="toggleEvidence(this)">
+            <span>Sources (${data.evidence.length})</span>
+            <span class="chevron">▾</span>
+          </button>
+          <div class="evidence-panel">${items}</div>
+        `;
+      }
+
+      // retrieval info chips
+      const boostedLaws = (data.retrieval_info?.boosted_laws || []).map(l => `<span class="law-tag">Law ${l}</span>`).join('');
+
+      const wrap = document.createElement('div');
+      wrap.className = 'msg ai';
+      wrap.innerHTML = `
+        <div class="msg-avatar">⚽</div>
+        <div class="msg-body">
+          <div class="msg-bubble">
+            ${boostedLaws ? `<div style="margin-bottom:10px">${boostedLaws}</div>` : ''}
+            <div class="ai-answer">${formattedAnswer}</div>
+            ${evidenceHtml}
+          </div>
+          <div class="msg-meta">
+            ${now}
+            ${ms ? `<span class="perf-badge"><span class="perf-dot"></span>${ms}ms</span>` : ''}
+          </div>
+        </div>`;
+
+      messages.appendChild(wrap);
+      scrollBottom();
+    }
+
+    // ─── FORMAT ANSWER ────────────────────────────────────────────
+    function formatAnswer(text) {
+      if (!text) return '';
+      let out = escHtml(text);
+
+      // bold section headers like "1) Relevant Law"
+      out = out.replace(/^(\d+\))\s+(.+)$/gm, '<strong style="color:var(--lime-bright)">$1 $2</strong>');
+
+      // bold "Decision:", "Restart:", "Discipline:"
+      out = out.replace(/(Decision|Restart|Discipline|Evidence):/g,
+        '<strong style="color:var(--line-white);opacity:0.9">$1:</strong>');
+
+      // highlight law references
+      out = out.replace(/Law\s+(\d+)/gi,
+        '<span class="law-tag">Law $1</span>');
+
+      // highlight card mentions
+      out = out.replace(/\byellow card\b/gi, '<span style="color:var(--yellow-card);font-weight:600">Yellow Card</span>');
+      out = out.replace(/\bred card\b/gi, '<span style="color:var(--red-card);font-weight:600">Red Card</span>');
+
+      // quote blocks
+      out = out.replace(/&quot;([^&]+)&quot;/g, '<span style="font-style:italic;color:var(--white-70)">"$1"</span>');
+
+      return out;
+    }
+
+    // ─── EVIDENCE TOGGLE ──────────────────────────────────────────
+    function toggleEvidence(btn) {
+      btn.classList.toggle('open');
+      const panel = btn.nextElementSibling;
+      panel.classList.toggle('open');
+    }
+
+    // ─── TYPING INDICATOR ─────────────────────────────────────────
+    let typingCounter = 0;
+    function addTyping() {
+      const id = 'typing-' + (++typingCounter);
+      const messages = document.getElementById('messages');
+      const wrap = document.createElement('div');
+      wrap.className = 'msg ai';
+      wrap.id = id;
+      wrap.innerHTML = `
+        <div class="msg-avatar">⚽</div>
+        <div class="msg-body">
+          <div class="typing-indicator">
+            <div class="typing-dot"></div>
+            <div class="typing-dot"></div>
+            <div class="typing-dot"></div>
+          </div>
+        </div>`;
+      messages.appendChild(wrap);
+      scrollBottom();
+      return id;
+    }
+
+    function removeTyping(id) {
+      document.getElementById(id)?.remove();
+    }
+
+    // ─── HELPERS ──────────────────────────────────────────────────
+    function setLoading(v) {
+      isLoading = v;
+      const btn = document.getElementById('send-btn');
+      btn.disabled = v;
+      if (v) {
+        btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" fill="none" stroke-dasharray="25" stroke-dashoffset="0"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur="0.8s" repeatCount="indefinite"/></circle></svg>`;
+      } else {
+        btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M14.5 8L1.5 1.5L4 8L1.5 14.5L14.5 8Z"/></svg>`;
+      }
+    }
+
+    function scrollBottom() {
+      const m = document.getElementById('messages');
+      requestAnimationFrame(() => { m.scrollTop = m.scrollHeight; });
+    }
+
+    function escHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // ─── TOAST ────────────────────────────────────────────────────
+    let toastTimer;
+    function showToast(msg, isError = false) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'toast show' + (isError ? ' error' : '');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { t.className = 'toast'; }, 3500);
+    }
+  </script>
+</body>
+</html>
