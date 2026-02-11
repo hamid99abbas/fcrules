@@ -4,27 +4,16 @@
     {
       "src": "api/index.py",
       "use": "@vercel/python"
-    },
-    {
-      "src": "public/**",
-      "use": "@vercel/static"
     }
   ],
   "routes": [
-    {
-      "src": "/",
-      "dest": "/public/index.html"
-    },
     {
       "src": "/api/(.*)",
       "dest": "api/index.py"
     },
     {
       "src": "/(.*)",
-      "dest": "/public/$1"
+      "dest": "public/index.html"
     }
-  ],
-  "env": {
-    "GEMINI_API_KEY": "@gemini_api_key"
-  }
+  ]
 }

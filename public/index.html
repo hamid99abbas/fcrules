@@ -914,7 +914,7 @@
           <div class="settings-row">
             <div class="api-input-wrap">
               <label>API</label>
-              <input type="text" id="api-url-input" value="http://localhost:8000" placeholder="http://localhost:8000" />
+              <input type="text" id="api-url-input" value="/api" placeholder="/api" />
             </div>
             <div class="setting-chip" id="chip-evidence" onclick="toggleChip(this)">
               <div class="setting-chip-dot"></div>
@@ -959,7 +959,10 @@
     let showEvidence = false;
     let includeRawChunks = false;
     let sessionQuestions = 0;
-    const API_BASE = () => document.getElementById('api-url-input').value.replace(/\/$/, '');
+    const API_BASE = () => {
+  const val = document.getElementById('api-url-input').value.replace(/\/$/, '');
+  return val || '/api'; // default to /api if empty
+           };
 
     // ─── BOOT ─────────────────────────────────────────────────────
     window.addEventListener('DOMContentLoaded', () => {
