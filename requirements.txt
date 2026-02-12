@@ -1,17 +1,8 @@
-# Core API
 fastapi==0.104.1
-uvicorn==0.24.0
 pydantic==2.5.0
-python-dotenv==1.0.0
-
-
-# RAG & Search
-numpy==1.26.2
-faiss-cpu==1.8.0
+numpy==1.24.3
+faiss-cpu==1.7.4
 rank-bm25==0.2.2
-
-# HuggingFace Inference API (lightweight - no model download!)
 huggingface-hub==0.19.4
-
-# Google Gemini
-google-genai==0.2.2
+google-genai==0.3.0
+uvicorn==0.24.0
