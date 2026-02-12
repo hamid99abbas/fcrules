@@ -559,20 +559,19 @@ async def startup_event():
 
 
 @app.get("/")
-@app.get("/api")
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
         "version": "2.1.0",
         "endpoints": {
-            "/api/ask": "POST - Ask a question",
-            "/api/health": "GET - Health check",
-            "/api/stats": "GET - Statistics"
+            "/ask": "POST - Ask a question",
+            "/health": "GET - Health check",
+            "/stats": "GET - Statistics"
         }
     }
 
 
-@app.get("/api/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
@@ -587,7 +586,7 @@ async def health_check():
     )
 
 
-@app.get("/api/stats", response_model=StatsResponse)
+@app.get("/stats", response_model=StatsResponse)
 async def get_stats():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
@@ -607,7 +606,7 @@ async def get_stats():
     )
 
 
-@app.post("/api/ask", response_model=QuestionResponse)
+@app.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     global query_count
 
