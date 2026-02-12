@@ -6,7 +6,7 @@
   ],
   "functions": {
     "api/index.py": {
-      "includeFiles": ["rag_chunks/**"]
+      "includeFiles": "rag_chunks/**"
     }
   },
   "routes": [
