@@ -511,19 +511,24 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 # -----------------------------
 # FASTAPI APP
 # -----------------------------
-app = FastAPI(
+# ✅ Inner API (your actual routes)
+api = FastAPI(
     title="Football Laws of the Game RAG API",
     description="Vercel Serverless Deployment with HuggingFace API",
     version="2.1.0"
 )
 
-app.add_middleware(
+api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ✅ Outer app (Vercel entrypoint)
+app = FastAPI()
+app.mount("/api", api)
 
 # Global state
 retriever: Optional[HybridRetriever] = None
@@ -532,7 +537,7 @@ start_time = time.time()
 query_count = 0
 
 
-@app.on_event("startup")
+@api.on_event("startup")
 async def startup_event():
     global retriever, hf_client
     try:
@@ -558,7 +563,7 @@ async def startup_event():
         raise
 
 
-@app.get("/")
+@api.get("/")
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
@@ -571,7 +576,7 @@ async def root():
     }
 
 
-@app.get("/health", response_model=HealthResponse)
+@api.get("/health", response_model=HealthResponse)
 async def health_check():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
@@ -586,7 +591,7 @@ async def health_check():
     )
 
 
-@app.get("/stats", response_model=StatsResponse)
+@api.get("/stats", response_model=StatsResponse)
 async def get_stats():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
@@ -606,7 +611,7 @@ async def get_stats():
     )
 
 
-@app.post("/ask", response_model=QuestionResponse)
+@api.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     global query_count
 
@@ -656,5 +661,5 @@ async def ask_question(request: QuestionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-
-# Vercel serverless handler
+# ✅ IMPORTANT: Do NOT define `handler` on Vercel.
+# Leave the module exporting only `app`.
