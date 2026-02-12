@@ -1,6 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.0 - With streaming and batch query support
+Version 2.1 - With HuggingFace Inference API (FREE)
 """
 import os
 import json
@@ -12,7 +12,7 @@ import asyncio
 import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from huggingface_hub import InferenceClient
 
 from google import genai
 from google.genai import types
@@ -24,10 +24,12 @@ from pydantic import BaseModel, Field
 import time
 from dotenv import load_dotenv
 load_dotenv()
+
 # -----------------------------
 # CONFIG
 # -----------------------------
 CHUNKS_PATH = Path(__file__).parent.parent / "rag_chunks" / "chunks.jsonl"
+EMBEDDINGS_PATH = Path(__file__).parent.parent / "rag_chunks" / "embeddings.npy"  # Pre-computed embeddings
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-2.5-flash"
 TOP_K = 10
@@ -36,9 +38,12 @@ TOP_K = 10
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
-# Gemini API key
+# API keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")  # Get free token from huggingface.co/settings/tokens
 
+if not HF_TOKEN:
+    print("⚠️  Warning: HF_TOKEN not found. Get your free token from https://huggingface.co/settings/tokens")
 
 # -----------------------------
 # PYDANTIC MODELS
@@ -89,6 +94,7 @@ class HealthResponse(BaseModel):
     retriever_loaded: bool
     model: str
     embedding_model: str
+    embedding_service: str
     uptime_seconds: float
 
 
@@ -97,6 +103,7 @@ class StatsResponse(BaseModel):
     embedding_dimension: int
     model: str
     embedding_model: str
+    embedding_service: str
     max_chars_per_chunk: int
     max_total_context_chars: int
     unique_laws: List[int]
@@ -104,7 +111,62 @@ class StatsResponse(BaseModel):
 
 
 # -----------------------------
-# UTILS (same as before)
+# HUGGINGFACE EMBEDDING CLIENT
+# -----------------------------
+class HFEmbeddingClient:
+    """Wrapper for HuggingFace Inference API embeddings"""
+
+    def __init__(self, token: str, model: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.client = InferenceClient(token=token)
+        self.model = model
+
+    def encode(self, texts: List[str], normalize: bool = True) -> np.ndarray:
+        """
+        Encode texts using HuggingFace Inference API
+
+        Args:
+            texts: List of texts to encode
+            normalize: Whether to normalize embeddings
+
+        Returns:
+            numpy array of embeddings
+        """
+        embeddings = []
+
+        for text in texts:
+            try:
+                # Call HuggingFace Inference API
+                embedding = self.client.feature_extraction(text, model=self.model)
+
+                # Convert to numpy array
+                if isinstance(embedding, list):
+                    embedding = np.array(embedding)
+
+                # Handle nested lists (batch dimension)
+                if embedding.ndim > 1:
+                    # Take mean pooling if needed
+                    embedding = embedding.mean(axis=0)
+
+                embeddings.append(embedding)
+
+            except Exception as e:
+                print(f"Error encoding text: {e}")
+                # Return zero vector on error
+                embeddings.append(np.zeros(384))  # all-MiniLM-L6-v2 has 384 dimensions
+
+        embeddings = np.array(embeddings, dtype=np.float32)
+
+        # Normalize if requested
+        if normalize:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1, norms)  # Avoid division by zero
+            embeddings = embeddings / norms
+
+        return embeddings
+
+
+# -----------------------------
+# UTILS
 # -----------------------------
 def tokenize(text: str) -> List[str]:
     text = text.lower()
@@ -122,6 +184,18 @@ def load_chunks(path: Path) -> List[Dict[str, Any]]:
             if line:
                 chunks.append(json.loads(line))
     return chunks
+
+
+def load_embeddings(path: Path) -> np.ndarray:
+    """Load pre-computed embeddings from .npy file"""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Embeddings file not found at: {path.resolve()}\n"
+            f"Please run the embedding generation script first to create embeddings.npy"
+        )
+    embeddings = np.load(path)
+    print(f"✓ Loaded embeddings with shape: {embeddings.shape}")
+    return embeddings
 
 
 def format_citation(c: Dict[str, Any]) -> str:
@@ -217,26 +291,27 @@ def extract_scenario_context(query: str) -> Dict[str, Any]:
 
 
 # -----------------------------
-# RETRIEVER
+# RETRIEVER (Updated for HF API)
 # -----------------------------
 class HybridRetriever:
-    def __init__(self, chunks: List[Dict[str, Any]]):
+    def __init__(self, chunks: List[Dict[str, Any]], embeddings: np.ndarray, hf_client: HFEmbeddingClient):
         self.chunks = chunks
+        self.hf_client = hf_client
+
+        # BM25 setup
         self.tokenized = [tokenize(c.get("text", "")) for c in chunks]
         self.bm25 = BM25Okapi(self.tokenized)
 
-        self.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-        embs = self.embedder.encode(
-            [c.get("text", "") for c in chunks],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=True,
-        ).astype("float32")
+        # Use pre-computed embeddings
+        self.embeddings = embeddings.astype("float32")
 
-        self.embeddings = embs
-        dim = embs.shape[1]
+        # FAISS index setup
+        dim = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dim)
-        self.index.add(embs)
+        self.index.add(self.embeddings)
+
+        print(f"✓ Retriever initialized with {len(chunks)} chunks")
+        print(f"✓ Embedding dimension: {dim}")
 
     def route_rules(self, query: str) -> Dict[str, Any]:
         q = query.lower()
@@ -315,8 +390,10 @@ class HybridRetriever:
         bm25_scores = self.bm25.get_scores(q_tokens)
         bm25_top = np.argsort(bm25_scores)[::-1][: max(80, top_k * 10)]
 
-        q_emb = self.embedder.encode([expanded_query], convert_to_numpy=True, normalize_embeddings=True).astype(
-            "float32")
+        # Use HuggingFace API to encode query
+        q_emb = self.hf_client.encode([expanded_query], normalize=True)
+
+        # Search FAISS index
         _, sim_ids = self.index.search(q_emb, k=max(80, top_k * 10))
         sim_ids = sim_ids[0].tolist()
 
@@ -470,8 +547,8 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 # -----------------------------
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Enhanced API for querying football/soccer Laws of the Game using RAG",
-    version="2.0.0"
+    description="Enhanced API with HuggingFace Inference API for embeddings (FREE)",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -484,19 +561,46 @@ app.add_middleware(
 
 # Global state
 retriever: Optional[HybridRetriever] = None
+hf_client: Optional[HFEmbeddingClient] = None
 start_time = time.time()
 query_count = 0
 
 
 @app.on_event("startup")
 async def startup_event():
-    global retriever
+    global retriever, hf_client
     try:
+        # Initialize HuggingFace client
+        if not HF_TOKEN:
+            raise ValueError(
+                "HF_TOKEN not found in environment variables.\n"
+                "Get your free token from https://huggingface.co/settings/tokens\n"
+                "Add it to your .env file: HF_TOKEN=your_token_here"
+            )
+
+        hf_client = HFEmbeddingClient(token=HF_TOKEN, model=EMBED_MODEL_NAME)
+        print(f"✓ HuggingFace client initialized with model: {EMBED_MODEL_NAME}")
+
+        # Load chunks
         chunks = load_chunks(CHUNKS_PATH)
-        retriever = HybridRetriever(chunks)
         print(f"✓ Loaded {len(chunks)} chunks from {CHUNKS_PATH.resolve()}")
-        print(f"✓ Retriever initialized with model: {EMBED_MODEL_NAME}")
+
+        # Load pre-computed embeddings
+        embeddings = load_embeddings(EMBEDDINGS_PATH)
+
+        # Verify dimensions match
+        if len(chunks) != len(embeddings):
+            raise ValueError(
+                f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings.\n"
+                "Please regenerate embeddings."
+            )
+
+        # Initialize retriever
+        retriever = HybridRetriever(chunks, embeddings, hf_client)
+
         print(f"✓ API ready on http://localhost:8000")
+        print(f"✓ Using HuggingFace Inference API (FREE)")
+
     except Exception as e:
         print(f"✗ Error during startup: {e}")
         raise
@@ -505,19 +609,21 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {
-        "message": "Football Laws of the Game RAG API v2.0",
-        "version": "2.0.0",
+        "message": "Football Laws of the Game RAG API v2.1",
+        "version": "2.1.0",
+        "embedding_service": "HuggingFace Inference API (FREE)",
         "endpoints": {
             "/ask": "POST - Ask a question about football laws",
             "/batch": "POST - Ask multiple questions at once",
             "/health": "GET - Health check with uptime",
             "/stats": "GET - Enhanced system statistics"
         },
-        "new_features": [
+        "features": [
+            "HuggingFace Inference API for embeddings",
+            "No local model download required",
             "Batch query processing",
             "Processing time metrics",
-            "Enhanced statistics",
-            "Raw chunk data option"
+            "Enhanced statistics"
         ]
     }
 
@@ -532,6 +638,7 @@ async def health_check():
         retriever_loaded=True,
         model=GEMINI_MODEL,
         embedding_model=EMBED_MODEL_NAME,
+        embedding_service="HuggingFace Inference API",
         uptime_seconds=time.time() - start_time
     )
 
@@ -549,6 +656,7 @@ async def get_stats():
         embedding_dimension=retriever.embeddings.shape[1],
         model=GEMINI_MODEL,
         embedding_model=EMBED_MODEL_NAME,
+        embedding_service="HuggingFace Inference API",
         max_chars_per_chunk=MAX_CHARS_PER_CHUNK,
         max_total_context_chars=MAX_TOTAL_CONTEXT_CHARS,
         unique_laws=unique_laws,
