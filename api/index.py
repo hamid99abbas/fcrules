@@ -6,7 +6,6 @@ import os
 import sys
 import json
 import re
-import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -26,6 +25,7 @@ import time
 # -----------------------------
 # CONFIG
 # -----------------------------
+# Adjust paths for Vercel deployment
 BASE_DIR = Path(__file__).parent.parent
 CHUNKS_PATH = BASE_DIR / "rag_chunks" / "chunks.jsonl"
 EMBEDDINGS_PATH = BASE_DIR / "rag_chunks" / "embeddings.npy"
@@ -34,9 +34,11 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-2.5-flash"
 TOP_K = 10
 
+# context controls
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
+# API keys from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
@@ -194,7 +196,8 @@ def expand_query_with_synonyms(query: str) -> str:
         if trigger in q_lower:
             expansions.extend(expansions_list)
     if expansions:
-        return query + " " + " ".join(expansions)
+        expanded = query + " " + " ".join(expansions)
+        return expanded
     return query
 
 
@@ -245,7 +248,7 @@ def has_physical_contact_intent(query: str) -> bool:
 
 def extract_scenario_context(query: str) -> Dict[str, Any]:
     q = query.lower()
-    return {
+    context = {
         "involves_teammate": any(term in q for term in ["teammate", "team mate", "own team"]),
         "involves_goalkeeper": any(term in q for term in ["goalkeeper", "goalie", "keeper"]),
         "involves_outfield_player": not any(term in q for term in ["goalkeeper", "goalie", "keeper"]),
@@ -256,6 +259,7 @@ def extract_scenario_context(query: str) -> Dict[str, Any]:
         "outside_interference": has_interference_intent(q),
         "physical_contact": has_physical_contact_intent(q),
     }
+    return context
 
 
 # -----------------------------
@@ -505,8 +509,9 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 
 
 # -----------------------------
-# FASTAPI APP (mounted at /api)
+# FASTAPI APP
 # -----------------------------
+# ✅ Inner API (your actual routes)
 api = FastAPI(
     title="Football Laws of the Game RAG API",
     description="Vercel Serverless Deployment with HuggingFace API",
@@ -521,6 +526,7 @@ api.add_middleware(
     allow_headers=["*"],
 )
 
+# ✅ Outer app (Vercel entrypoint)
 app = FastAPI()
 app.mount("/api", api)
 
@@ -530,25 +536,16 @@ hf_client: Optional[HFEmbeddingClient] = None
 start_time = time.time()
 query_count = 0
 
-_init_lock = asyncio.Lock()
 
-async def ensure_retriever_loaded():
+@api.on_event("startup")
+async def startup_event():
     global retriever, hf_client
-
-    if retriever is not None:
-        return
-
-    async with _init_lock:
-        if retriever is not None:
-            return
-
+    try:
         if not HF_TOKEN:
-            raise HTTPException(status_code=500, detail="HF_TOKEN not found in environment variables")
-        if not GEMINI_API_KEY:
-            raise HTTPException(status_code=500, detail="GEMINI_API_KEY not found in environment variables")
+            raise ValueError("HF_TOKEN not found in environment variables")
 
         hf_client = HFEmbeddingClient(token=HF_TOKEN, model=EMBED_MODEL_NAME)
-        print("✓ HuggingFace client initialized")
+        print(f"✓ HuggingFace client initialized")
 
         chunks = load_chunks(CHUNKS_PATH)
         print(f"✓ Loaded {len(chunks)} chunks")
@@ -556,10 +553,14 @@ async def ensure_retriever_loaded():
         embeddings = load_embeddings(EMBEDDINGS_PATH)
 
         if len(chunks) != len(embeddings):
-            raise HTTPException(status_code=500, detail=f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
+            raise ValueError(f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
 
         retriever = HybridRetriever(chunks, embeddings, hf_client)
-        print("✓ API ready")
+        print(f"✓ API ready")
+
+    except Exception as e:
+        print(f"✗ Error during startup: {e}")
+        raise
 
 
 @api.get("/")
@@ -577,7 +578,9 @@ async def root():
 
 @api.get("/health", response_model=HealthResponse)
 async def health_check():
-    await ensure_retriever_loaded()
+    if retriever is None:
+        raise HTTPException(status_code=503, detail="Retriever not initialized")
+
     return HealthResponse(
         status="healthy",
         retriever_loaded=True,
@@ -590,9 +593,11 @@ async def health_check():
 
 @api.get("/stats", response_model=StatsResponse)
 async def get_stats():
-    await ensure_retriever_loaded()
+    if retriever is None:
+        raise HTTPException(status_code=503, detail="Retriever not initialized")
 
     unique_laws = sorted(list(set(c.get("law_number") for c in retriever.chunks if c.get("law_number"))))
+
     return StatsResponse(
         total_chunks=len(retriever.chunks),
         embedding_dimension=retriever.embeddings.shape[1],
@@ -609,46 +614,52 @@ async def get_stats():
 @api.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     global query_count
-    await ensure_retriever_loaded()
 
-    start = time.time()
+    if retriever is None:
+        raise HTTPException(status_code=503, detail="Retriever not initialized")
 
-    top_chunks = retriever.search(request.question, top_k=request.top_k)
-    answer = gemini_answer(request.question, top_chunks)
+    try:
+        start = time.time()
 
-    evidence_list = []
-    for i, chunk in enumerate(top_chunks, 1):
-        txt = chunk.get("text", "") or ""
-        text_preview = (txt[:200] + "...") if len(txt) > 200 else txt
-        evidence_list.append(
-            Evidence(
-                rank=i,
-                citation=format_citation(chunk),
-                text_preview=text_preview,
-                full_text=txt if request.include_raw_chunks else None
+        top_chunks = retriever.search(request.question, top_k=request.top_k)
+        answer = gemini_answer(request.question, top_chunks)
+
+        evidence_list = []
+        for i, chunk in enumerate(top_chunks, 1):
+            text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get("text", "")
+            evidence_list.append(
+                Evidence(
+                    rank=i,
+                    citation=format_citation(chunk),
+                    text_preview=text_preview,
+                    full_text=chunk.get("text", "") if request.include_raw_chunks else None
+                )
             )
+
+        routing = retriever.route_rules(request.question)
+        scenario = extract_scenario_context(request.question)
+
+        retrieval_info = {
+            "expanded_query": expand_query_with_synonyms(request.question),
+            "quote_mode": is_quote_mode(request.question),
+            "boosted_laws": list(routing["law_boost"]) if routing["law_boost"] else [],
+            "scenario_context": scenario,
+            "chunks_retrieved": len(top_chunks)
+        }
+
+        processing_time = (time.time() - start) * 1000
+        query_count += 1
+
+        return QuestionResponse(
+            question=request.question,
+            answer=answer,
+            evidence=evidence_list,
+            retrieval_info=retrieval_info,
+            processing_time_ms=processing_time
         )
 
-    routing = retriever.route_rules(request.question)
-    scenario = extract_scenario_context(request.question)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-    retrieval_info = {
-        "expanded_query": expand_query_with_synonyms(request.question),
-        "quote_mode": is_quote_mode(request.question),
-        "boosted_laws": list(routing["law_boost"]) if routing["law_boost"] else [],
-        "scenario_context": scenario,
-        "chunks_retrieved": len(top_chunks)
-    }
-
-    processing_time = (time.time() - start) * 1000
-    query_count += 1
-
-    return QuestionResponse(
-        question=request.question,
-        answer=answer,
-        evidence=evidence_list,
-        retrieval_info=retrieval_info,
-        processing_time_ms=processing_time
-    )
-
-# IMPORTANT: do NOT define `handler` on Vercel.
+# ✅ IMPORTANT: Do NOT define `handler` on Vercel.
+# Leave the module exporting only `app`.
