@@ -1,13 +1,13 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.1 - Vercel Serverless Deployment
+Version 2.1 - With HuggingFace Inference API (FREE)
 """
 import os
-import sys
 import json
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import asyncio
 
 import numpy as np
 import faiss
@@ -17,19 +17,20 @@ from huggingface_hub import InferenceClient
 from google import genai
 from google.genai import types
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-# Adjust paths for Vercel deployment
-BASE_DIR = Path(__file__).parent.parent
-CHUNKS_PATH = BASE_DIR / "rag_chunks" / "chunks.jsonl"
-EMBEDDINGS_PATH = BASE_DIR / "rag_chunks" / "embeddings.npy"
-
+CHUNKS_PATH = Path(__file__).parent.parent / "rag_chunks" / "chunks.jsonl"
+EMBEDDINGS_PATH = Path(__file__).parent.parent / "rag_chunks" / "embeddings.npy"  # Pre-computed embeddings
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-2.5-flash"
 TOP_K = 10
@@ -38,14 +39,13 @@ TOP_K = 10
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
-# API keys from environment
+# API keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")  # Get free token from huggingface.co/settings/tokens
 
 if not HF_TOKEN:
-    print("⚠️  Warning: HF_TOKEN not found in environment variables")
-if not GEMINI_API_KEY:
-    print("⚠️  Warning: GEMINI_API_KEY not found in environment variables")
+    print("⚠️  Warning: HF_TOKEN not found. Get your free token from https://huggingface.co/settings/tokens")
+
 
 # -----------------------------
 # PYDANTIC MODELS
@@ -59,6 +59,16 @@ class QuestionRequest(BaseModel):
 class BatchQuestionRequest(BaseModel):
     questions: List[str] = Field(..., description="List of questions to ask", max_items=10)
     top_k: Optional[int] = Field(10, description="Number of top chunks to retrieve per question")
+
+
+class Citation(BaseModel):
+    law_number: Optional[int]
+    law_title: Optional[str]
+    subsection_number: Optional[str]
+    subsection_title: Optional[str]
+    page_start: Optional[int]
+    page_end: Optional[int]
+    chunk_id: Optional[str]
 
 
 class Evidence(BaseModel):
@@ -113,29 +123,45 @@ class HFEmbeddingClient:
         self.model = model
 
     def encode(self, texts: List[str], normalize: bool = True) -> np.ndarray:
+        """
+        Encode texts using HuggingFace Inference API
+
+        Args:
+            texts: List of texts to encode
+            normalize: Whether to normalize embeddings
+
+        Returns:
+            numpy array of embeddings
+        """
         embeddings = []
 
         for text in texts:
             try:
+                # Call HuggingFace Inference API
                 embedding = self.client.feature_extraction(text, model=self.model)
 
+                # Convert to numpy array
                 if isinstance(embedding, list):
                     embedding = np.array(embedding)
 
+                # Handle nested lists (batch dimension)
                 if embedding.ndim > 1:
+                    # Take mean pooling if needed
                     embedding = embedding.mean(axis=0)
 
                 embeddings.append(embedding)
 
             except Exception as e:
                 print(f"Error encoding text: {e}")
-                embeddings.append(np.zeros(384))
+                # Return zero vector on error
+                embeddings.append(np.zeros(384))  # all-MiniLM-L6-v2 has 384 dimensions
 
         embeddings = np.array(embeddings, dtype=np.float32)
 
+        # Normalize if requested
         if normalize:
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1, norms)
+            norms = np.where(norms == 0, 1, norms)  # Avoid division by zero
             embeddings = embeddings / norms
 
         return embeddings
@@ -163,8 +189,12 @@ def load_chunks(path: Path) -> List[Dict[str, Any]]:
 
 
 def load_embeddings(path: Path) -> np.ndarray:
+    """Load pre-computed embeddings from .npy file"""
     if not path.exists():
-        raise FileNotFoundError(f"Embeddings file not found at: {path.resolve()}")
+        raise FileNotFoundError(
+            f"Embeddings file not found at: {path.resolve()}\n"
+            f"Please run the embedding generation script first to create embeddings.npy"
+        )
     embeddings = np.load(path)
     print(f"✓ Loaded embeddings with shape: {embeddings.shape}")
     return embeddings
@@ -263,23 +293,27 @@ def extract_scenario_context(query: str) -> Dict[str, Any]:
 
 
 # -----------------------------
-# RETRIEVER
+# RETRIEVER (Updated for HF API)
 # -----------------------------
 class HybridRetriever:
     def __init__(self, chunks: List[Dict[str, Any]], embeddings: np.ndarray, hf_client: HFEmbeddingClient):
         self.chunks = chunks
         self.hf_client = hf_client
 
+        # BM25 setup
         self.tokenized = [tokenize(c.get("text", "")) for c in chunks]
         self.bm25 = BM25Okapi(self.tokenized)
 
+        # Use pre-computed embeddings
         self.embeddings = embeddings.astype("float32")
 
+        # FAISS index setup
         dim = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(self.embeddings)
 
         print(f"✓ Retriever initialized with {len(chunks)} chunks")
+        print(f"✓ Embedding dimension: {dim}")
 
     def route_rules(self, query: str) -> Dict[str, Any]:
         q = query.lower()
@@ -358,8 +392,10 @@ class HybridRetriever:
         bm25_scores = self.bm25.get_scores(q_tokens)
         bm25_top = np.argsort(bm25_scores)[::-1][: max(80, top_k * 10)]
 
+        # Use HuggingFace API to encode query
         q_emb = self.hf_client.encode([expanded_query], normalize=True)
 
+        # Search FAISS index
         _, sim_ids = self.index.search(q_emb, k=max(80, top_k * 10))
         sim_ids = sim_ids[0].tolist()
 
@@ -511,24 +547,19 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 # -----------------------------
 # FASTAPI APP
 # -----------------------------
-# ✅ Inner API (your actual routes)
-api = FastAPI(
+app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Vercel Serverless Deployment with HuggingFace API",
+    description="Enhanced API with HuggingFace Inference API for embeddings (FREE)",
     version="2.1.0"
 )
 
-api.add_middleware(
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ✅ Outer app (Vercel entrypoint)
-app = FastAPI()
-app.mount("/api", api)
 
 # Global state
 retriever: Optional[HybridRetriever] = None
@@ -537,46 +568,69 @@ start_time = time.time()
 query_count = 0
 
 
-@api.on_event("startup")
+@app.on_event("startup")
 async def startup_event():
     global retriever, hf_client
     try:
+        # Initialize HuggingFace client
         if not HF_TOKEN:
-            raise ValueError("HF_TOKEN not found in environment variables")
+            raise ValueError(
+                "HF_TOKEN not found in environment variables.\n"
+                "Get your free token from https://huggingface.co/settings/tokens\n"
+                "Add it to your .env file: HF_TOKEN=your_token_here"
+            )
 
         hf_client = HFEmbeddingClient(token=HF_TOKEN, model=EMBED_MODEL_NAME)
-        print(f"✓ HuggingFace client initialized")
+        print(f"✓ HuggingFace client initialized with model: {EMBED_MODEL_NAME}")
 
+        # Load chunks
         chunks = load_chunks(CHUNKS_PATH)
-        print(f"✓ Loaded {len(chunks)} chunks")
+        print(f"✓ Loaded {len(chunks)} chunks from {CHUNKS_PATH.resolve()}")
 
+        # Load pre-computed embeddings
         embeddings = load_embeddings(EMBEDDINGS_PATH)
 
+        # Verify dimensions match
         if len(chunks) != len(embeddings):
-            raise ValueError(f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
+            raise ValueError(
+                f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings.\n"
+                "Please regenerate embeddings."
+            )
 
+        # Initialize retriever
         retriever = HybridRetriever(chunks, embeddings, hf_client)
-        print(f"✓ API ready")
+
+        print(f"✓ API ready on http://localhost:8000")
+        print(f"✓ Using HuggingFace Inference API (FREE)")
 
     except Exception as e:
         print(f"✗ Error during startup: {e}")
         raise
 
 
-@api.get("/")
+@app.get("/")
 async def root():
     return {
-        "message": "Football Laws of the Game RAG API",
+        "message": "Football Laws of the Game RAG API v2.1",
         "version": "2.1.0",
+        "embedding_service": "HuggingFace Inference API (FREE)",
         "endpoints": {
-            "/ask": "POST - Ask a question",
-            "/health": "GET - Health check",
-            "/stats": "GET - Statistics"
-        }
+            "/ask": "POST - Ask a question about football laws",
+            "/batch": "POST - Ask multiple questions at once",
+            "/health": "GET - Health check with uptime",
+            "/stats": "GET - Enhanced system statistics"
+        },
+        "features": [
+            "HuggingFace Inference API for embeddings",
+            "No local model download required",
+            "Batch query processing",
+            "Processing time metrics",
+            "Enhanced statistics"
+        ]
     }
 
 
-@api.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
@@ -591,11 +645,12 @@ async def health_check():
     )
 
 
-@api.get("/stats", response_model=StatsResponse)
+@app.get("/stats", response_model=StatsResponse)
 async def get_stats():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
 
+    # Get unique law numbers
     unique_laws = sorted(list(set(c.get("law_number") for c in retriever.chunks if c.get("law_number"))))
 
     return StatsResponse(
@@ -611,7 +666,7 @@ async def get_stats():
     )
 
 
-@api.post("/ask", response_model=QuestionResponse)
+@app.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     global query_count
 
@@ -621,12 +676,17 @@ async def ask_question(request: QuestionRequest):
     try:
         start = time.time()
 
+        # Retrieve relevant chunks
         top_chunks = retriever.search(request.question, top_k=request.top_k)
+
+        # Generate answer with Gemini
         answer = gemini_answer(request.question, top_chunks)
 
+        # Build evidence list
         evidence_list = []
         for i, chunk in enumerate(top_chunks, 1):
-            text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get("text", "")
+            text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get(
+                "text", "")
             evidence_list.append(
                 Evidence(
                     rank=i,
@@ -636,6 +696,7 @@ async def ask_question(request: QuestionRequest):
                 )
             )
 
+        # Extract retrieval info
         routing = retriever.route_rules(request.question)
         scenario = extract_scenario_context(request.question)
 
@@ -647,7 +708,7 @@ async def ask_question(request: QuestionRequest):
             "chunks_retrieved": len(top_chunks)
         }
 
-        processing_time = (time.time() - start) * 1000
+        processing_time = (time.time() - start) * 1000  # Convert to milliseconds
         query_count += 1
 
         return QuestionResponse(
@@ -659,7 +720,79 @@ async def ask_question(request: QuestionRequest):
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
 
-# ✅ IMPORTANT: Do NOT define `handler` on Vercel.
-# Leave the module exporting only `app`.
+
+@app.post("/batch", response_model=BatchQuestionResponse)
+async def batch_questions(request: BatchQuestionRequest):
+    """Process multiple questions in a batch"""
+    global query_count
+
+    if retriever is None:
+        raise HTTPException(status_code=503, detail="Retriever not initialized")
+
+    if not request.questions:
+        raise HTTPException(status_code=400, detail="No questions provided")
+
+    try:
+        batch_start = time.time()
+        results = []
+
+        for question in request.questions:
+            start = time.time()
+
+            top_chunks = retriever.search(question, top_k=request.top_k)
+            answer = gemini_answer(question, top_chunks)
+
+            evidence_list = []
+            for i, chunk in enumerate(top_chunks, 1):
+                text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get(
+                    "text", "")
+                evidence_list.append(
+                    Evidence(
+                        rank=i,
+                        citation=format_citation(chunk),
+                        text_preview=text_preview
+                    )
+                )
+
+            routing = retriever.route_rules(question)
+            scenario = extract_scenario_context(question)
+
+            retrieval_info = {
+                "expanded_query": expand_query_with_synonyms(question),
+                "quote_mode": is_quote_mode(question),
+                "boosted_laws": list(routing["law_boost"]) if routing["law_boost"] else [],
+                "scenario_context": scenario,
+                "chunks_retrieved": len(top_chunks)
+            }
+
+            processing_time = (time.time() - start) * 1000
+
+            results.append(
+                QuestionResponse(
+                    question=question,
+                    answer=answer,
+                    evidence=evidence_list,
+                    retrieval_info=retrieval_info,
+                    processing_time_ms=processing_time
+                )
+            )
+
+            query_count += 1
+
+        total_processing_time = (time.time() - batch_start) * 1000
+
+        return BatchQuestionResponse(
+            results=results,
+            total_processing_time_ms=total_processing_time
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
