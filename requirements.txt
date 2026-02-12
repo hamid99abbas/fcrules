@@ -3,6 +3,7 @@ fastapi==0.104.1
 uvicorn==0.24.0
 pydantic==2.5.0
 python-dotenv==1.0.0
+mangum==0.17.0
 
 # RAG & Search
 numpy==1.26.2
@@ -14,6 +15,3 @@ huggingface-hub==0.19.4
 
 # Google Gemini
 google-genai==0.2.2
-
-# Note: sentence-transformers is NOT needed for runtime!
-# It's only needed to run generate_embeddings.py locally

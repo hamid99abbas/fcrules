@@ -8,6 +8,7 @@ import json
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from mangum import Mangum
 
 import numpy as np
 import faiss
@@ -658,4 +659,4 @@ async def ask_question(request: QuestionRequest):
 
 
 # Vercel serverless handler
-handler = app
+handler = Mangum(app)
