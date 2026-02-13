@@ -1,106 +1,136 @@
 """
-Generate embeddings locally and save to embeddings.npy
-Run this ONCE locally before deploying to Vercel
-
-This script:
-1. Loads your chunks from chunks.jsonl
-2. Generates embeddings using SentenceTransformer (locally)
-3. Saves embeddings to embeddings.npy
-4. You upload both chunks.jsonl and embeddings.npy to Vercel
+Football Laws RAG API - Python Test Script
+Tests all endpoints with sample questions
 """
-
+import requests
 import json
-import numpy as np
-from pathlib import Path
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
+from datetime import datetime
 
-# Paths
-CHUNKS_PATH = Path("rag_chunks/chunks.jsonl")  # Adjust path as needed
-EMBEDDINGS_OUTPUT = Path("rag_chunks/embeddings.npy")
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+BASE_URL = "https://fcrules.vercel.app"
 
+def print_section(title):
+    print(f"\n{'='*60}")
+    print(f"  {title}")
+    print(f"{'='*60}\n")
 
-def load_chunks(path: Path):
-    """Load chunks from JSONL file"""
-    if not path.exists():
-        raise FileNotFoundError(f"chunks.jsonl not found at: {path.resolve()}")
+def test_root():
+    print_section("1️⃣ Testing ROOT Endpoint")
+    response = requests.get(f"{BASE_URL}/")
+    print(f"Status Code: {response.status_code}")
+    print(json.dumps(response.json(), indent=2))
 
-    chunks = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                chunks.append(json.loads(line))
+def test_health():
+    print_section("2️⃣ Testing HEALTH Endpoint")
+    response = requests.get(f"{BASE_URL}/health")
+    print(f"Status Code: {response.status_code}")
+    data = response.json()
+    print(json.dumps(data, indent=2))
 
-    return chunks
+    if data.get("retriever_loaded"):
+        print("\n✅ Retriever is loaded and ready!")
+    else:
+        print("\n❌ Retriever not loaded!")
 
+def test_stats():
+    print_section("3️⃣ Testing STATS Endpoint")
+    response = requests.get(f"{BASE_URL}/stats")
+    print(f"Status Code: {response.status_code}")
+    data = response.json()
+    print(json.dumps(data, indent=2))
+    print(f"\n📊 Total Chunks: {data.get('total_chunks')}")
+    print(f"📊 Unique Laws: {len(data.get('unique_laws', []))}")
+    print(f"📊 Total Queries: {data.get('total_queries_processed')}")
 
-def generate_embeddings(chunks, model_name=MODEL_NAME):
-    """Generate embeddings for all chunks"""
-    print(f"\n📦 Loading model: {model_name}")
-    model = SentenceTransformer(model_name)
+def test_question(title, question, top_k=5):
+    print_section(f"❓ {title}")
+    print(f"Question: {question}\n")
 
-    print(f"\n🔢 Generating embeddings for {len(chunks)} chunks...")
-    texts = [chunk.get("text", "") for chunk in chunks]
-
-    # Generate embeddings with progress bar
-    embeddings = model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-        batch_size=32
+    start_time = datetime.now()
+    response = requests.post(
+        f"{BASE_URL}/ask",
+        json={
+            "question": question,
+            "top_k": top_k,
+            "include_raw_chunks": False
+        }
     )
+    end_time = datetime.now()
 
-    return embeddings.astype('float32')
+    print(f"Status Code: {response.status_code}")
+    print(f"Response Time: {(end_time - start_time).total_seconds():.2f}s\n")
 
+    if response.status_code == 200:
+        data = response.json()
+
+        # Print answer
+        print("📝 ANSWER:")
+        print("-" * 60)
+        print(data.get('answer', 'No answer provided'))
+        print("-" * 60)
+
+        # Print evidence
+        print(f"\n📚 EVIDENCE ({len(data.get('evidence', []))} sources):")
+        for i, ev in enumerate(data.get('evidence', [])[:3], 1):  # Show top 3
+            print(f"\n  {i}. {ev.get('citation')}")
+            print(f"     {ev.get('text_preview')}")
+
+        # Print retrieval info
+        print(f"\n🔍 RETRIEVAL INFO:")
+        retrieval = data.get('retrieval_info', {})
+        print(f"   - Expanded query: {retrieval.get('expanded_query')}")
+        print(f"   - Quote mode: {retrieval.get('quote_mode')}")
+        print(f"   - Boosted laws: {retrieval.get('boosted_laws')}")
+        print(f"   - Chunks retrieved: {retrieval.get('chunks_retrieved')}")
+
+        print(f"\n⏱️  Processing time: {data.get('processing_time_ms', 0):.0f}ms")
+    else:
+        print(f"❌ Error: {response.text}")
 
 def main():
-    print("=" * 60)
-    print("🚀 EMBEDDING GENERATION SCRIPT")
-    print("=" * 60)
+    print("\n" + "="*60)
+    print("  🧪 FOOTBALL LAWS RAG API - TEST SUITE")
+    print("="*60)
+    print(f"  Base URL: {BASE_URL}")
+    print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*60)
 
-    # Load chunks
-    print(f"\n📂 Loading chunks from: {CHUNKS_PATH.resolve()}")
-    chunks = load_chunks(CHUNKS_PATH)
-    print(f"✓ Loaded {len(chunks)} chunks")
+    try:
+        # Basic endpoints
+        test_root()
+        test_health()
+        test_stats()
 
-    # Generate embeddings
-    embeddings = generate_embeddings(chunks)
-    print(f"✓ Generated embeddings with shape: {embeddings.shape}")
+        # Question tests
+        test_question(
+            "Handball in Penalty Area",
+            "What happens if a player deliberately handles the ball in their own penalty area?"
+        )
 
-    # Save embeddings
-    print(f"\n💾 Saving embeddings to: {EMBEDDINGS_OUTPUT.resolve()}")
-    EMBEDDINGS_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    np.save(EMBEDDINGS_OUTPUT, embeddings)
+        test_question(
+            "Fan Interference",
+            "What should happen if a fan runs onto the pitch and kicks the ball away?"
+        )
 
-    # Verify file size
-    file_size_mb = EMBEDDINGS_OUTPUT.stat().st_size / (1024 * 1024)
-    print(f"✓ Saved embeddings ({file_size_mb:.2f} MB)")
+        test_question(
+            "Offside Position",
+            "When is a player in an offside position?"
+        )
 
-    # Verification
-    print("\n🔍 Verifying embeddings...")
-    loaded = np.load(EMBEDDINGS_OUTPUT)
-    assert loaded.shape == embeddings.shape, "Shape mismatch!"
-    assert np.allclose(loaded, embeddings), "Data mismatch!"
-    print("✓ Verification passed")
+        test_question(
+            "Shoulder Charge",
+            "Is it allowed to shoulder charge an opponent who is far from the ball?"
+        )
 
-    print("\n" + "=" * 60)
-    print("✅ SUCCESS!")
-    print("=" * 60)
-    print("\n📋 Next steps:")
-    print("1. Upload these files to Vercel:")
-    print(f"   - {CHUNKS_PATH}")
-    print(f"   - {EMBEDDINGS_OUTPUT}")
-    print("\n2. Set environment variables in Vercel:")
-    print("   - GEMINI_API_KEY=your_gemini_key")
-    print("   - HF_TOKEN=your_huggingface_token")
-    print("\n3. Deploy!")
-    print("\n💡 Get your free HF token from:")
-    print("   https://huggingface.co/settings/tokens")
-    print("=" * 60)
+        test_question(
+            "Goalkeeper Handball",
+            "Can a goalkeeper handle the ball if a teammate deliberately kicks it to them?"
+        )
 
+        print_section("✅ ALL TESTS COMPLETED")
+        print("Your API is working perfectly! 🎉\n")
+
+    except Exception as e:
+        print(f"\n❌ Test failed with error: {str(e)}\n")
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,9 @@ import os
 import sys
 import json
 import re
+import logging
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -13,9 +16,6 @@ import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
 from huggingface_hub import InferenceClient
-
-from google import genai
-from google.genai import types
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,14 +38,25 @@ TOP_K = 10
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
+# persistent query counter
+COUNTER_FILE_PATH = BASE_DIR / "query_counter.json"
+COUNTER_KEY = "all_time_queries"
+
 # API keys from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not HF_TOKEN:
-    print("⚠️  Warning: HF_TOKEN not found in environment variables")
+    print("Warning: HF_TOKEN not found in environment variables")
 if not GEMINI_API_KEY:
-    print("⚠️  Warning: GEMINI_API_KEY not found in environment variables")
+    print("Warning: GEMINI_API_KEY not found in environment variables")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("fcrules.api")
+counter_lock = threading.Lock()
 
 # -----------------------------
 # PYDANTIC MODELS
@@ -166,8 +177,93 @@ def load_embeddings(path: Path) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f"Embeddings file not found at: {path.resolve()}")
     embeddings = np.load(path)
-    print(f"✓ Loaded embeddings with shape: {embeddings.shape}")
+    print(f"Loaded embeddings with shape: {embeddings.shape}")
     return embeddings
+
+
+def load_query_counter_from_file() -> int:
+    if not COUNTER_FILE_PATH.exists():
+        logger.warning(
+            "Query counter file not found at %s. Creating a new counter with 0.",
+            COUNTER_FILE_PATH,
+        )
+        if not persist_query_counter_to_file(0):
+            logger.error("Failed to create query counter file during startup.")
+        return 0
+
+    try:
+        with COUNTER_FILE_PATH.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        counter_value = int(payload.get(COUNTER_KEY, 0))
+        if counter_value < 0:
+            raise ValueError(f"{COUNTER_KEY} must be >= 0, got {counter_value}")
+        logger.info("Loaded query counter from file: %s", counter_value)
+        return counter_value
+    except Exception:
+        logger.exception(
+            "Failed to load query counter from %s. Falling back to 0.",
+            COUNTER_FILE_PATH,
+        )
+        return 0
+
+
+def persist_query_counter_to_file(count: int) -> bool:
+    temp_path = COUNTER_FILE_PATH.with_suffix(".tmp")
+    payload = {COUNTER_KEY: int(count)}
+
+    try:
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True)
+
+        os.replace(temp_path, COUNTER_FILE_PATH)
+
+        with COUNTER_FILE_PATH.open("r", encoding="utf-8") as f:
+            written_payload = json.load(f)
+        written_value = int(written_payload.get(COUNTER_KEY, -1))
+
+        if written_value != int(count):
+            logger.error(
+                "Query counter verification failed. expected=%s written=%s file=%s",
+                count,
+                written_value,
+                COUNTER_FILE_PATH,
+            )
+            return False
+
+        logger.info(
+            "Query counter updated successfully. value=%s file=%s",
+            written_value,
+            COUNTER_FILE_PATH,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to persist query counter. value=%s file=%s",
+            count,
+            COUNTER_FILE_PATH,
+        )
+        return False
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                logger.warning("Could not remove temporary counter file: %s", temp_path)
+
+
+def increment_and_persist_query_counter() -> tuple[int, bool]:
+    global query_count
+
+    with counter_lock:
+        query_count += 1
+        persisted = persist_query_counter_to_file(query_count)
+        if not persisted:
+            logger.error(
+                "Counter incremented in memory but failed to persist. in_memory=%s file=%s",
+                query_count,
+                COUNTER_FILE_PATH,
+            )
+        return query_count, persisted
 
 
 def format_citation(c: Dict[str, Any]) -> str:
@@ -191,6 +287,9 @@ def expand_query_with_synonyms(query: str) -> str:
         "strikes with hand": ["handball", "handles ball", "touches with hand", "hand ball"],
         "comes on pitch": ["enters field of play", "extra person on field"],
         "what should happen": ["what is the decision", "what is the restart", "what action"],
+        "obstacle": ["outside agent", "object", "interference", "dropped ball", "match official", "law 9"],
+        "match official": ["referee", "touches a match official", "ball out of play", "dropped ball", "law 9"],
+        "referee": ["match official", "touches a match official", "ball out of play", "dropped ball", "law 9"],
     }
     for trigger, expansions_list in synonym_map.items():
         if trigger in q_lower:
@@ -232,7 +331,8 @@ def has_interference_intent(query: str) -> bool:
     q = query.lower()
     interference_terms = [
         "fan", "spectator", "interrupts", "interference", "outside agent",
-        "animal", "object enters", "comes on pitch", "enters field", "extra person"
+        "animal", "object enters", "comes on pitch", "enters field", "extra person",
+        "obstacle", "object", "outside object", "match official", "referee",
     ]
     return any(term in q for term in interference_terms)
 
@@ -279,7 +379,7 @@ class HybridRetriever:
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(self.embeddings)
 
-        print(f"✓ Retriever initialized with {len(chunks)} chunks")
+        print(f"Retriever initialized with {len(chunks)} chunks")
 
     def route_rules(self, query: str) -> Dict[str, Any]:
         q = query.lower()
@@ -303,7 +403,17 @@ class HybridRetriever:
             subsection_terms += [
                 "outside interference", "outside agent", "extra person", "spectator",
                 "dropped ball", "enters the field of play", "interferes with play",
-                "stops play", "animal", "object", "unauthorized person"
+                "stops play", "animal", "object", "unauthorized person",
+                "ball out of play", "ball in play"
+            ]
+
+        if any(k in q for k in ["referee", "match official"]):
+            law_boost.update([9, 5, 8])
+            subsection_terms += [
+                "touches a match official",
+                "ball out of play",
+                "dropped ball",
+                "outside interference",
             ]
 
         if has_physical_contact_intent(q):
@@ -436,6 +546,17 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY.")
 
+    try:
+        from google import genai
+        from google.genai import types
+    except MemoryError as e:
+        raise RuntimeError(
+            "Unable to import google-genai due to memory limits. "
+            "Use Python 3.11 with updated dependencies or increase available memory."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Unable to import google-genai: {e}") from e
+
     client = genai.Client(api_key=GEMINI_API_KEY)
     quote_mode = is_quote_mode(question)
     scenario = extract_scenario_context(question)
@@ -511,10 +632,53 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 # -----------------------------
 # FASTAPI APP
 # -----------------------------
+# Global state
+retriever: Optional[HybridRetriever] = None
+hf_client: Optional[HFEmbeddingClient] = None
+start_time = time.time()
+query_count = 0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global retriever, hf_client, query_count
+    if not HF_TOKEN:
+        logger.warning("HF_TOKEN not found. Starting API without retriever.")
+        query_count = load_query_counter_from_file()
+        yield
+        return
+
+    try:
+        hf_client = HFEmbeddingClient(token=HF_TOKEN, model=EMBED_MODEL_NAME)
+        print("HuggingFace client initialised")
+
+        chunks = load_chunks(CHUNKS_PATH)
+        print(f"Loaded {len(chunks)} chunks")
+
+        embeddings = load_embeddings(EMBEDDINGS_PATH)
+
+        if len(chunks) != len(embeddings):
+            raise ValueError(f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
+
+        retriever = HybridRetriever(chunks, embeddings, hf_client)
+        query_count = load_query_counter_from_file()
+        logger.info("Startup complete. query_count=%s", query_count)
+        print("API ready")
+    except Exception as e:
+        logger.exception("Error during startup; continuing without retriever")
+        print(f"Error during startup (degraded mode): {e}")
+        retriever = None
+        hf_client = None
+        query_count = load_query_counter_from_file()
+
+    yield
+
+
 app = FastAPI(
     title="Football Laws of the Game RAG API",
     description="Vercel Serverless Deployment with HuggingFace API",
-    version="2.1.0"
+    version="2.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -524,38 +688,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global state
-retriever: Optional[HybridRetriever] = None
-hf_client: Optional[HFEmbeddingClient] = None
-start_time = time.time()
-query_count = 0
-
-
-@app.on_event("startup")
-async def startup_event():
-    global retriever, hf_client
-    try:
-        if not HF_TOKEN:
-            raise ValueError("HF_TOKEN not found in environment variables")
-
-        hf_client = HFEmbeddingClient(token=HF_TOKEN, model=EMBED_MODEL_NAME)
-        print(f"✓ HuggingFace client initialised")
-
-        chunks = load_chunks(CHUNKS_PATH)
-        print(f"✓ Loaded {len(chunks)} chunks")
-
-        embeddings = load_embeddings(EMBEDDINGS_PATH)
-
-        if len(chunks) != len(embeddings):
-            raise ValueError(f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
-
-        retriever = HybridRetriever(chunks, embeddings, hf_client)
-        print(f"✓ API ready")
-
-    except Exception as e:
-        print(f"✗ Error during startup: {e}")
-        raise
 
 
 @app.get("/")
@@ -614,6 +746,7 @@ async def ask_question(request: QuestionRequest):
         raise HTTPException(status_code=503, detail="Retriever not initialised")
 
     try:
+        logger.info("Received /ask request. question=%s", request.question)
         start = time.time()
 
         top_chunks = retriever.search(request.question, top_k=request.top_k)
@@ -643,7 +776,20 @@ async def ask_question(request: QuestionRequest):
         }
 
         processing_time = (time.time() - start) * 1000
-        query_count += 1
+        latest_count, counter_persisted = increment_and_persist_query_counter()
+        retrieval_info["query_counter"] = {
+            "value": latest_count,
+            "persisted": counter_persisted,
+            "file_path": str(COUNTER_FILE_PATH),
+        }
+        if not counter_persisted:
+            retrieval_info["query_counter"]["error"] = "Counter was not persisted. Check server logs."
+        logger.info(
+            "Completed /ask request. processing_time_ms=%.2f counter=%s persisted=%s",
+            processing_time,
+            latest_count,
+            counter_persisted,
+        )
 
         return QuestionResponse(
             question=request.question,
@@ -654,4 +800,8 @@ async def ask_question(request: QuestionRequest):
         )
 
     except Exception as e:
+        logger.exception("Error while processing /ask request")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+

@@ -1,23 +1,45 @@
 {
-  "total_chunks": 119,
+  "total_input_chunks": 119,
+  "total_core_sections": 78,
+  "total_output_chunks": 151,
   "chunks_per_law": {
-    "Law 01 - The Field of Play": 14,
-    "Law 02 - The Ball": 3,
-    "Law 03 - The Players": 10,
-    "Law 04 - The Players’ Equipment": 6,
-    "Law 05 - The Referee": 7,
-    "Law 06 - The Other Match Officials": 7,
-    "Law 07 - The Duration of the Match": 5,
-    "Law 08 - The Start and Restart of Play": 2,
-    "Law 09 - The Ball in and out of Play": 2,
-    "Law 10 - Determining the Outcome of a Match": 3,
-    "Law 11 - Offside": 4,
-    "Law 12 - Fouls and Misconduct": 5,
-    "Law 13 - Free Kicks": 3,
-    "Law 14 - The Penalty Kick": 3,
-    "Law 15 - The Throw-in": 2,
-    "Law 16 - The Goal Kick": 2,
-    "Law 17 - The Corner Kick": 41
+    "1": 19,
+    "2": 4,
+    "3": 15,
+    "4": 11,
+    "5": 17,
+    "6": 8,
+    "7": 3,
+    "8": 4,
+    "9": 2,
+    "10": 8,
+    "11": 9,
+    "12": 28,
+    "13": 6,
+    "14": 9,
+    "15": 3,
+    "16": 3,
+    "17": 2
   },
-  "output_jsonl": "rag_chunks\\chunks.jsonl"
+  "dropped_or_trimmed_counts": {
+    "too_short_after_cleaning": 2,
+    "appendix_tail_trimmed": 1,
+    "duplicate_law_subsection": 16,
+    "subsection_out_of_range": 23
+  },
+  "config": {
+    "use_subchunks": true,
+    "target_tokens": 170,
+    "overlap_tokens": 35,
+    "min_chars": 120,
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2"
+  },
+  "backups": {
+    "chunks_backup": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\chunks.backup_20260213_161330.jsonl",
+    "embeddings_backup": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\embeddings.backup_20260213_161330.npy"
+  },
+  "output_files": {
+    "chunks_jsonl": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\chunks.jsonl",
+    "embeddings_npy": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\embeddings.npy"
+  }
 }
