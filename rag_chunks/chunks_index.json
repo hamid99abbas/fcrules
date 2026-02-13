@@ -1,31 +1,22 @@
 {
-  "total_input_chunks": 119,
-  "total_core_sections": 78,
-  "total_output_chunks": 151,
+  "total_input_chunks": 90,
+  "total_core_sections": 21,
+  "total_output_chunks": 21,
   "chunks_per_law": {
-    "1": 19,
-    "2": 4,
-    "3": 15,
-    "4": 11,
-    "5": 17,
-    "6": 8,
-    "7": 3,
-    "8": 4,
-    "9": 2,
-    "10": 8,
-    "11": 9,
-    "12": 28,
-    "13": 6,
-    "14": 9,
-    "15": 3,
-    "16": 3,
+    "1": 1,
+    "2": 1,
+    "3": 4,
+    "5": 1,
+    "12": 4,
+    "13": 2,
+    "14": 2,
+    "15": 2,
+    "16": 2,
     "17": 2
   },
   "dropped_or_trimmed_counts": {
-    "too_short_after_cleaning": 2,
-    "appendix_tail_trimmed": 1,
-    "duplicate_law_subsection": 16,
-    "subsection_out_of_range": 23
+    "duplicate_law_subsection": 49,
+    "subsection_out_of_range": 20
   },
   "config": {
     "use_subchunks": true,
@@ -35,11 +26,11 @@
     "model_name": "sentence-transformers/all-MiniLM-L6-v2"
   },
   "backups": {
-    "chunks_backup": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\chunks.backup_20260213_161330.jsonl",
-    "embeddings_backup": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\embeddings.backup_20260213_161330.npy"
+    "chunks_backup": "D:\\fcrules\\rag_chunks\\chunks.backup_20260213_181322.jsonl",
+    "embeddings_backup": "D:\\fcrules\\rag_chunks\\embeddings.backup_20260213_181322.npy"
   },
   "output_files": {
-    "chunks_jsonl": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\chunks.jsonl",
-    "embeddings_npy": "D:\\1. Syed Basit Abbas\\1. Projects\\Football RAG\\rag_chunks\\embeddings.npy"
+    "chunks_jsonl": "D:\\fcrules\\rag_chunks\\chunks.jsonl",
+    "embeddings_npy": "D:\\fcrules\\rag_chunks\\embeddings.npy"
   }
 }

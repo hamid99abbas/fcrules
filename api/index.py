@@ -1,9 +1,8 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.2 - Optimized for New Chunks with Introductions
+Version 2.3 - Optimized for Proper Chunking
 """
 import os
-import sys
 import json
 import re
 import logging
@@ -25,7 +24,6 @@ import time
 # -----------------------------
 # CONFIG
 # -----------------------------
-# Adjust paths for Vercel deployment
 BASE_DIR = Path(__file__).parent.parent
 CHUNKS_PATH = BASE_DIR / "rag_chunks" / "chunks.jsonl"
 EMBEDDINGS_PATH = BASE_DIR / "rag_chunks" / "embeddings.npy"
@@ -67,11 +65,6 @@ class QuestionRequest(BaseModel):
     include_raw_chunks: Optional[bool] = Field(False, description="Include raw chunk data in response")
 
 
-class BatchQuestionRequest(BaseModel):
-    questions: List[str] = Field(..., description="List of questions to ask", max_items=10)
-    top_k: Optional[int] = Field(10, description="Number of top chunks to retrieve per question")
-
-
 class Evidence(BaseModel):
     rank: int
     citation: str
@@ -85,11 +78,6 @@ class QuestionResponse(BaseModel):
     evidence: List[Evidence]
     retrieval_info: Dict[str, Any]
     processing_time_ms: Optional[float] = None
-
-
-class BatchQuestionResponse(BaseModel):
-    results: List[QuestionResponse]
-    total_processing_time_ms: float
 
 
 class HealthResponse(BaseModel):
@@ -111,7 +99,7 @@ class StatsResponse(BaseModel):
     max_total_context_chars: int
     unique_laws: List[int]
     total_queries_processed: int
-    intro_chunks_count: int  # NEW
+    intro_chunks_count: int
 
 
 # -----------------------------
@@ -288,49 +276,30 @@ def format_citation(c: Dict[str, Any]) -> str:
 
 
 def expand_query_with_synonyms(query: str) -> str:
-    """Enhanced query expansion with new triggers for intro content"""
+    """Enhanced query expansion"""
     q_lower = query.lower()
     expansions = []
 
     synonym_map = {
-        # Existing mappings
-        "fan": ["spectator", "outside agent", "person not on team list"],
-        "interrupts": ["interference", "interferes with play", "enters field"],
-        "kicks away": ["touches ball", "plays ball", "interferes"],
-        "shoulder charge": ["charges", "physical challenge", "body contact"],
-        "far from ball": ["not within playing distance", "ball not in playing distance"],
-        "strikes with hand": ["handball", "handles ball", "touches with hand", "hand ball"],
-        "comes on pitch": ["enters field of play", "extra person on field"],
-        "what should happen": ["what is the decision", "what is the restart", "what action"],
-        "obstacle": ["outside agent", "object", "interference", "dropped ball", "match official", "law 9"],
-        "match official": ["referee", "touches a match official", "ball out of play", "dropped ball", "law 9"],
+        # Core mappings
         "referee": ["match official", "touches a match official", "ball out of play", "dropped ball", "law 9"],
+        "match official": ["referee", "touches a match official", "ball out of play", "dropped ball", "law 9"],
+        "ball hits referee": ["touches a match official", "law 9", "ball out of play", "dropped ball", "promising attack"],
 
-        # NEW: Intro-specific expansions for the previously missing content
+        # Goal scoring mappings
         "throw-in": ["throw in", "Law 15", "awarded", "introduction"],
-        "own goal": ["kicker's goal", "thrower's goal", "team's goal", "goal kick awarded", "corner kick awarded", "introduction"],
-        "corner kick": ["corner", "Law 17", "introduction"],
-        "goal kick": ["Law 16", "penalty area", "retaken", "introduction"],
-        "directly": ["direct", "straight", "without touching", "introduction"],
-        "into own goal": ["kicker's goal", "thrower's goal", "corner kick awarded", "goal kick awarded"],
-        "into thrower's goal": ["corner kick awarded", "own goal", "Law 15 introduction"],
-        "into kicker's goal": ["corner kick awarded", "own goal", "Law 16 Law 17 introduction"],
+        "own goal": ["kicker's goal", "thrower's goal", "corner kick awarded", "goal kick awarded", "introduction"],
+        "corner kick": ["corner", "Law 17", "introduction", "directly"],
+        "goal kick": ["Law 16", "introduction", "directly", "penalty area"],
+        "goalkeeper score": ["goal may be scored", "directly", "opposing team", "Law 16"],
+
+        # Other mappings
+        "handball": ["handling the ball", "touches with hand", "law 12"],
+        "fan": ["spectator", "outside agent", "interference"],
+        "substitute": ["substitution", "law 3", "extra person"],
     }
 
-    # Multi-word phrase detection for better matching
-    if "throw-in" in q_lower and "own goal" in q_lower:
-        expansions += ["corner kick awarded", "Law 15", "introduction", "directly"]
-
-    if "corner" in q_lower and "own goal" in q_lower:
-        expansions += ["corner kick awarded", "Law 17", "introduction", "directly", "kicker's goal"]
-
-    if "goal kick" in q_lower and ("own goal" in q_lower or "kicker's goal" in q_lower):
-        expansions += ["corner kick awarded", "Law 16", "introduction", "directly"]
-
-    if "doesn't leave" in q_lower or "not leave" in q_lower:
-        expansions += ["penalty area", "retaken", "in play", "clearly moves"]
-
-    # Apply single-word mappings
+    # Apply mappings
     for trigger, expansions_list in synonym_map.items():
         if trigger in q_lower:
             expansions.extend(expansions_list)
@@ -341,67 +310,14 @@ def expand_query_with_synonyms(query: str) -> str:
     return query
 
 
-def is_quote_mode(query: str) -> bool:
-    q = query.lower()
-    triggers = [
-        "where exactly", "exact wording", "quote", "verbatim", "exact paragraph",
-        "show me the exact", "cite the exact", "written"
-    ]
-    return any(t in q for t in triggers)
-
-
-def has_discipline_intent(query: str) -> bool:
-    q = query.lower()
-    return any(k in q for k in ["card", "caution", "yellow", "red", "send off", "sent off", "discipline", "sanction"])
-
-
-def has_restart_intent(query: str) -> bool:
-    q = query.lower()
-    return any(k in q for k in
-               ["restart", "free kick", "penalty", "dropped ball", "indirect", "direct", "kick-off", "throw-in",
-                "goal kick", "corner kick", "awarded"])  # Added "awarded"
-
-
-def has_handball_intent(query: str) -> bool:
-    q = query.lower()
-    handball_terms = ["handball", "hand ball", "hand", "arm", "handle", "handling", "touches with hand",
-                      "strikes with hand"]
-    return any(term in q for term in handball_terms)
-
-
-def has_interference_intent(query: str) -> bool:
-    q = query.lower()
-    interference_terms = [
-        "fan", "spectator", "interrupts", "interference", "outside agent",
-        "animal", "object enters", "comes on pitch", "enters field", "extra person",
-        "obstacle", "object", "outside object", "match official", "referee",
-    ]
-    return any(term in q for term in interference_terms)
-
-
-def has_physical_contact_intent(query: str) -> bool:
-    q = query.lower()
-    contact_terms = [
-        "charge", "charging", "shoulder charge", "physical contact",
-        "pushes", "push", "holds", "holding", "tackles", "tackle"
-    ]
-    return any(term in q for term in contact_terms)
-
-
 def extract_scenario_context(query: str) -> Dict[str, Any]:
     q = query.lower()
     context = {
-        "involves_teammate": any(term in q for term in ["teammate", "team mate", "own team"]),
+        "involves_referee": any(term in q for term in ["referee", "match official", "ball hits"]),
         "involves_goalkeeper": any(term in q for term in ["goalkeeper", "goalie", "keeper"]),
-        "involves_outfield_player": not any(term in q for term in ["goalkeeper", "goalie", "keeper"]),
-        "own_half": any(term in q for term in ["own half", "own goal", "own side"]),
-        "penalty_area": any(term in q for term in ["penalty area", "penalty box", "box"]),
-        "deliberate": any(term in q for term in ["deliberate", "intentional"]),
-        "far_from_ball": any(term in q for term in ["far from ball", "not near ball", "away from ball"]),
-        "outside_interference": has_interference_intent(q),
-        "physical_contact": has_physical_contact_intent(q),
-        "into_own_goal": any(term in q for term in ["own goal", "into own", "thrower's goal", "kicker's goal"]),  # NEW
-        "directly": "directly" in q or "direct" in q,  # NEW
+        "into_own_goal": any(term in q for term in ["own goal", "into own", "thrower's goal", "kicker's goal"]),
+        "directly": "directly" in q or "direct" in q,
+        "can_score": any(term in q for term in ["can score", "may score", "score from"]),
     }
     return context
 
@@ -430,91 +346,50 @@ class HybridRetriever:
         law_boost = set()
         subsection_terms = []
 
-        if has_handball_intent(q):
-            law_boost.add(12)
-            subsection_terms += ["Handling the ball", "handball offence", "Direct free kick",
-                                 "scores in the opponents' goal"]
-            scenario = extract_scenario_context(q)
-            if scenario["penalty_area"]:
-                subsection_terms += ["penalty area", "penalty kick"]
-            if scenario["involves_teammate"]:
-                subsection_terms += ["deliberately kicked to the goalkeeper by a team-mate"]
-            if scenario["own_half"] or scenario["penalty_area"]:
-                subsection_terms += ["inside their penalty area", "penalty kick", "direct free kick"]
-
-        if has_interference_intent(q):
-            law_boost.update([5, 9, 3])
-            subsection_terms += [
-                "outside interference", "outside agent", "extra person", "spectator",
-                "dropped ball", "enters the field of play", "interferes with play",
-                "stops play", "animal", "object", "unauthorized person",
-                "ball out of play", "ball in play"
-            ]
-
-        if any(k in q for k in ["referee", "match official"]):
-            law_boost.update([9, 5, 8])
+        # Ball hits referee
+        if any(k in q for k in ["referee", "match official", "ball hits"]):
+            law_boost.update([9, 8])
             subsection_terms += [
                 "touches a match official",
                 "ball out of play",
+                "ball in play",
                 "dropped ball",
-                "outside interference",
+                "promising attack",
+                "possession changes",
             ]
 
-        if has_physical_contact_intent(q):
-            law_boost.add(12)
-            subsection_terms += [
-                "charges", "physical challenge", "careless", "reckless", "excessive force",
-                "playing distance", "within playing distance", "shield the ball",
-                "fairly charged", "impedes the progress", "Direct free kick"
-            ]
-            scenario = extract_scenario_context(q)
-            if scenario["far_from_ball"]:
-                subsection_terms += [
-                    "not within playing distance", "without any contact",
-                    "impeding the progress", "indirect free kick"
-                ]
+        # Goal scoring questions
+        if "goal kick" in q or "goalkeeper score" in q:
+            law_boost.add(16)
+            if "score" in q or "goal may" in q or "directly" in q:
+                subsection_terms += ["introduction", "goal may be scored", "directly", "opposing team"]
 
-        # NEW: Enhanced routing for intro-specific queries
         if "throw-in" in q:
             law_boost.add(15)
-            if "own goal" in q or "thrower's goal" in q or "directly" in q:
-                subsection_terms += ["introduction", "corner kick", "goal kick", "directly", "cannot be scored"]
+            if "own goal" in q or "score" in q or "directly" in q:
+                subsection_terms += ["introduction", "corner kick", "goal kick", "cannot be scored"]
 
         if "corner" in q:
             law_boost.add(17)
-            if "own goal" in q or "kicker's goal" in q or "directly" in q:
-                subsection_terms += ["introduction", "corner kick", "directly", "opposing team"]
+            if "own goal" in q or "score" in q or "directly" in q:
+                subsection_terms += ["introduction", "goal may be scored", "directly"]
 
-        if "goal kick" in q:
-            law_boost.add(16)
-            if "own goal" in q or "kicker's goal" in q or "directly" in q:
-                subsection_terms += ["introduction", "corner kick", "directly", "opposing team"]
-            if "doesn't leave" in q or "not leave" in q or "penalty area" in q:
-                subsection_terms += ["penalty area", "in play", "retaken", "clearly moves"]
+        # Handball
+        if any(k in q for k in ["handball", "hand", "arm"]):
+            law_boost.add(12)
+            subsection_terms += ["handball", "handling the ball", "direct free kick"]
 
+        # Offside
         if "offside" in q:
             law_boost.add(11)
-        if "dropped ball" in q:
-            law_boost.update([8, 9])
-        if "penalty kick" in q or "penalty" in q:
+
+        # Penalty
+        if "penalty" in q:
             law_boost.add(14)
-        if "technical area" in q:
-            law_boost.add(1)
-        if any(k in q for k in ["ball pressure", "circumference", "ball size", "size of the ball", "pressure"]):
-            law_boost.add(2)
-        if any(k in q for k in ["number of players", "minimum seven", "seven players", "how many players"]):
+
+        # Substitution
+        if any(k in q for k in ["substitute", "substitution", "sub"]):
             law_boost.add(3)
-
-        if has_discipline_intent(q):
-            law_boost.update([12, 3])
-            subsection_terms += ["Disciplinary", "Offences and sanctions", "sending-off", "caution", "sent off"]
-
-        if has_restart_intent(q):
-            subsection_terms += ["Restart", "Restart of play", "Offences and sanctions", "introduction"]
-
-        if any(k in q for k in ["substitute", "extra person", "team official", "enters the pitch"]):
-            law_boost.add(3)
-            subsection_terms += ["Extra persons", "Substitution procedure", "Offences and sanctions"]
 
         return {"law_boost": law_boost, "subsection_terms": subsection_terms}
 
@@ -544,16 +419,15 @@ class HybridRetriever:
             score += float(np.dot(q_emb[0], self.embeddings[i])) * 4.0
 
             if law_boost and c.get("law_number") in law_boost:
-                boost_mult = 1.5 if has_handball_intent(query) or has_interference_intent(query) else 1.25
-                score *= boost_mult
+                score *= 1.5
 
-            # NEW: Boost introduction chunks (subsection 0) for "own goal" / "directly" queries
+            # Boost introduction chunks for goal-scoring and direct questions
             scenario = extract_scenario_context(query)
-            if c.get("subsection_number") == 0:  # Introduction section
-                if scenario["into_own_goal"] or scenario["directly"]:
-                    score *= 1.4  # Significant boost for intros when asking about "own goal" scenarios
+            if c.get("subsection_number") == 0:  # Introduction
+                if scenario["into_own_goal"] or scenario["directly"] or scenario["can_score"]:
+                    score *= 1.5
                 else:
-                    score *= 1.15  # Mild boost for intros in general
+                    score *= 1.2
 
             if subsection_terms:
                 sub_title = (c.get("subsection_title") or "").lower()
@@ -613,36 +487,22 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
     try:
         from google import genai
         from google.genai import types
-    except MemoryError as e:
-        raise RuntimeError(
-            "Unable to import google-genai due to memory limits. "
-            "Use Python 3.11 with updated dependencies or increase available memory."
-        ) from e
     except Exception as e:
         raise RuntimeError(f"Unable to import google-genai: {e}") from e
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    quote_mode = is_quote_mode(question)
     scenario = extract_scenario_context(question)
     context = build_context(chunks)
 
     scenario_hints = []
-    if scenario["involves_teammate"]:
-        scenario_hints.append("The scenario involves a teammate passing/kicking to another teammate.")
-    if scenario["own_half"]:
-        scenario_hints.append("The incident occurs in the team's own half.")
-    if scenario["penalty_area"]:
-        scenario_hints.append("The incident may occur in the penalty area.")
-    if scenario["far_from_ball"]:
-        scenario_hints.append("The player is far from the ball (not within playing distance).")
-    if scenario["outside_interference"]:
-        scenario_hints.append("This involves outside interference (fan, spectator, or unauthorised person).")
-    if scenario["physical_contact"]:
-        scenario_hints.append("This involves physical contact between players.")
+    if scenario["involves_referee"]:
+        scenario_hints.append("This question is about the ball touching a match official/referee.")
     if scenario["into_own_goal"]:
         scenario_hints.append("The ball enters the kicker's/thrower's own goal.")
     if scenario["directly"]:
         scenario_hints.append("The ball enters directly (without touching another player).")
+    if scenario["can_score"]:
+        scenario_hints.append("This is asking whether a goal can be scored in this situation.")
 
     scenario_text = "\n".join(scenario_hints) if scenario_hints else "General scenario."
 
@@ -651,25 +511,15 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "You MUST answer using ONLY the provided EXTRACTS.\n"
         "If any part of the answer is not clearly supported by the extracts, write:\n"
         "\"Not found in the provided extracts\" for that part.\n\n"
-        "IMPORTANT RULES:\n"
-        "- When the question involves a SPECIFIC SCENARIO (e.g., teammate passing to teammate, "
-        "player far from ball, fan interference, ball into own goal), apply the general rules to that specific scenario.\n"
-        "- If the extract provides criteria/tests (e.g., 'it is an offence if ...'), "
-        "explain how those criteria apply to the specific scenario described.\n"
-        "- Consider WHERE the offence occurs (own half vs penalty area) when determining the restart.\n"
-        "- For physical contact offences, consider whether the ball was within playing distance.\n"
-        "- For outside interference, explain when play should stop and how it should restart.\n"
-        "- Pay special attention to INTRODUCTION sections (subsection 0) which contain important rules "
-        "about restarts when the ball enters own goal or specific scenarios.\n\n"
         "For every answer, follow this structure exactly:\n\n"
         "1) Answer (Direct response to the question)\n"
         "   - Decision: [What should happen - be specific to the scenario]\n"
-        "   - Restart: [Specify the exact restart based on location]\n"
+        "   - Restart: [Specify the exact restart based on the situation]\n"
         "   - Discipline: [If applicable, otherwise state 'None']\n"
         "   - Explanation: [Brief plain English explanation applied to the specific scenario]\n\n"
         "2) Supporting Law References\n"
         "   - Relevant Law & subsection: [Law number + subsection title]\n"
-        "   - Evidence: [Provide 1–2 short quotes max unless QUOTE MODE is ON]\n"
+        "   - Evidence: [Provide 1–2 short quotes]\n"
         "   - Citation: [Include the exact CITATION line after each quote]\n\n"
         "Rules:\n"
         "- Lead with the ANSWER - what actually happens in this scenario\n"
@@ -677,15 +527,12 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "- Do not invent Laws, restarts, or cards.\n"
         "- Do not use outside knowledge.\n"
         "- Every Decision/Restart/Discipline claim must be supported by the Evidence quotes.\n"
-        "- When multiple extracts are relevant, synthesise them into one coherent answer.\n"
-        "- Pay special attention to conditions like 'within playing distance' for physical offences.\n"
-        "- Introduction sections often contain the most direct rules for 'own goal' scenarios.\n"
+        "- Pay special attention to Introduction sections which often contain key rules.\n"
     )
 
     user_prompt = (
         f"QUESTION:\n{question}\n\n"
         f"SCENARIO CONTEXT:\n{scenario_text}\n\n"
-        f"QUOTE MODE: {'ON' if quote_mode else 'OFF'}\n\n"
         f"EXTRACTS:\n{context}"
     )
 
@@ -703,7 +550,6 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 # -----------------------------
 # FASTAPI APP
 # -----------------------------
-# Global state
 retriever: Optional[HybridRetriever] = None
 hf_client: Optional[HFEmbeddingClient] = None
 start_time = time.time()
@@ -747,8 +593,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Vercel Serverless Deployment with HuggingFace API - Optimized for chunks with introductions",
-    version="2.2.0",
+    description="Optimized for proper chunking with all laws",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -765,18 +611,12 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "endpoints": {
             "/ask": "POST - Ask a question",
             "/health": "GET - Health check",
             "/stats": "GET - Statistics"
-        },
-        "improvements": [
-            "Enhanced support for Law introductions (subsection 0)",
-            "Better handling of 'own goal' scenarios",
-            "Improved query expansion for throw-in, corner kick, goal kick",
-            "Optimized retrieval for directly-into-goal questions"
-        ]
+        }
     }
 
 
@@ -848,7 +688,6 @@ async def ask_question(request: QuestionRequest):
 
         retrieval_info = {
             "expanded_query": expand_query_with_synonyms(request.question),
-            "quote_mode": is_quote_mode(request.question),
             "boosted_laws": list(routing["law_boost"]) if routing["law_boost"] else [],
             "scenario_context": scenario,
             "chunks_retrieved": len(top_chunks)
@@ -859,15 +698,12 @@ async def ask_question(request: QuestionRequest):
         retrieval_info["query_counter"] = {
             "value": latest_count,
             "persisted": counter_persisted,
-            "file_path": str(COUNTER_FILE_PATH),
         }
-        if not counter_persisted:
-            retrieval_info["query_counter"]["error"] = "Counter was not persisted. Check server logs."
+
         logger.info(
-            "Completed /ask request. processing_time_ms=%.2f counter=%s persisted=%s",
+            "Completed /ask request. processing_time_ms=%.2f counter=%s",
             processing_time,
             latest_count,
-            counter_persisted,
         )
 
         return QuestionResponse(

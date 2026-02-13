@@ -1,0 +1,47 @@
+{
+  "total_chunks": 39,
+  "total_subchunks": 37,
+  "total_introductions": 38,
+  "laws_found": [
+    1,
+    6
+  ],
+  "laws_missing": [
+    2,
+    3,
+    4,
+    5,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17
+  ],
+  "embedding_dimension": 384,
+  "chunks_per_law": {
+    "1": 1,
+    "6": 38
+  },
+  "subsections_per_law": {
+    "1": 1,
+    "6": 2
+  },
+  "introductions_per_law": {
+    "1": 1,
+    "6": 37
+  },
+  "avg_chunk_length": 957,
+  "config": {
+    "target_tokens": 170,
+    "overlap_tokens": 35,
+    "min_chunk_chars": 80,
+    "min_intro_chars": 30,
+    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2"
+  }
+}

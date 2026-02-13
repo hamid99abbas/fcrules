@@ -1,49 +1,49 @@
 """
-Complete FIFA Laws of the Game Chunker & Embedder
-==================================================
-Standalone version using pdftotext (no PyMuPDF needed)
+Complete FIFA Laws of the Game Chunker & Embedder - FINAL WORKING VERSION
+==========================================================================
+Two-step approach:
+1. Extract each Law using TOC (PyMuPDF)
+2. Split into subsections with introductions
+3. Generate embeddings
 
-This script performs end-to-end processing:
-1. Extracts text from PDF using pdftotext
-2. Identifies Laws 1-17 and their subsections
-3. Creates hierarchical chunks with intro paragraphs
-4. Performs intelligent sub-chunking for long sections
-5. Generates embeddings using sentence-transformers
-6. Outputs chunks.jsonl and embeddings.npy
+This combines your working code with improvements for:
+- Introduction detection (subsection 0)
+- Better text cleaning
+- Embedding generation
+- Sub-chunking for long sections
 
-Key Features:
-- ✅ Captures law introductions (the missing "own goal" rules!)
-- ✅ Preserves section hierarchy with subsection 0 for intros
-- ✅ Handles edge cases and validates chunk quality
-- ✅ Creates semantic sub-chunks with overlap
-- ✅ Works offline with pdftotext
+Install:
+  pip install pymupdf sentence-transformers
 
-Author: Enhanced for FIFA Laws 2025/26
+Run:
+  python laws_chunker_final.py "Laws of the Game 2025_26.pdf"
 """
 
-import os
-import re
 import json
-import subprocess
-import argparse
+import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
-from collections import defaultdict
+import argparse
 import warnings
 
 import numpy as np
 
-warnings.filterwarnings("ignore")
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    print("ERROR: PyMuPDF not installed. Run: pip install pymupdf")
 
-# Try to import sentence-transformers, fall back to placeholder
 try:
     from sentence_transformers import SentenceTransformer
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
-    print("Warning: sentence-transformers not available. Install with:")
-    print("  pip install sentence-transformers")
+    print("Warning: sentence-transformers not available")
+
+warnings.filterwarnings("ignore")
 
 
 # ============================================================================
@@ -52,64 +52,26 @@ except ImportError:
 
 @dataclass
 class ChunkConfig:
-    """Configuration for chunking behavior"""
+    """Configuration for chunking"""
+    # Text cleaning
+    min_intro_chars: int = 30
+    min_chunk_chars: int = 80
+    max_subsections_per_law: int = 15  # Safety limit
+
     # Sub-chunking
     enable_subchunking: bool = True
     target_tokens: int = 170
     overlap_tokens: int = 35
-    min_subchunk_tokens: int = 50
-
-    # Quality filters
-    min_chunk_chars: int = 80
-    remove_headers_footers: bool = True
 
     # Embedding
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     batch_size: int = 32
-    normalize_embeddings: bool = True
     skip_embeddings: bool = False
 
 
-# Law structure from IFAB 2025/26
-LAW_STRUCTURE = {
-    1: {"title": "The Field of Play", "max_subsections": 14},
-    2: {"title": "The Ball", "max_subsections": 3},
-    3: {"title": "The Players", "max_subsections": 10},
-    4: {"title": "The Players' Equipment", "max_subsections": 6},
-    5: {"title": "The Referee", "max_subsections": 7},
-    6: {"title": "The Other Match Officials", "max_subsections": 6},
-    7: {"title": "The Duration of the Match", "max_subsections": 5},
-    8: {"title": "The Start and Restart of Play", "max_subsections": 2},
-    9: {"title": "The Ball in and out of Play", "max_subsections": 2},
-    10: {"title": "Determining the Outcome of a Match", "max_subsections": 3},
-    11: {"title": "Offside", "max_subsections": 4},
-    12: {"title": "Fouls and Misconduct", "max_subsections": 5},
-    13: {"title": "Free Kicks", "max_subsections": 3},
-    14: {"title": "The Penalty Kick", "max_subsections": 3},
-    15: {"title": "The Throw-in", "max_subsections": 2},
-    16: {"title": "The Goal Kick", "max_subsections": 2},
-    17: {"title": "The Corner Kick", "max_subsections": 2},
-}
-
-# Stop words for appendices - content after these should be ignored
-APPENDIX_MARKERS = [
-    'video assistant referee (var) protocol',
-    'var protocol',
-    'practical guidelines for match officials',
-    'fifa quality programme',
-    'glossary',
-    'football terms',
-    'law changes 2025/26',
-]
-
-
-# ============================================================================
-# CHUNK DATA STRUCTURE
-# ============================================================================
-
 @dataclass
 class LawChunk:
-    """Represents a chunk of law text"""
+    """Chunk with metadata"""
     chunk_id: str
     law_number: int
     law_title: str
@@ -123,292 +85,363 @@ class LawChunk:
     is_subchunk: bool = False
     parent_chunk_id: Optional[str] = None
     subchunk_index: Optional[int] = None
-    section_type: str = "core_law"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
         d = asdict(self)
-        # Remove None values
         return {k: v for k, v in d.items() if v is not None}
 
 
 # ============================================================================
-# PDF EXTRACTION
+# STEP 1: EXTRACT LAWS FROM PDF
 # ============================================================================
 
-class PDFTextExtractor:
-    """Extract text from PDF using pdftotext"""
+class LawExtractor:
+    """Extract individual laws from PDF using TOC"""
 
-    def __init__(self, pdf_path: Path, config: ChunkConfig):
+    # Matches TOC lines like: "1 The Field of Play 41"
+    TOC_LINE_RE = re.compile(r"^\s*(\d{1,2})\s+(.+?)\s+(\d{1,4})\s*$")
+
+    # Matches body header
+    BODY_HEADER_RE = re.compile(
+        r"Laws\s+of\s+the\s+Game\s+2025/26\s*\|\s*Law\s*(\d{1,2})\s*\|\s*(.+?)(?:\s+(\d{1,4}))?\s*$",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, pdf_path: Path):
+        if not PYMUPDF_AVAILABLE:
+            raise RuntimeError("PyMuPDF not installed")
         self.pdf_path = pdf_path
+        self.pages = []
+
+    def extract_pages(self) -> List[Dict[str, Any]]:
+        """Extract all page texts"""
+        doc = fitz.open(self.pdf_path)
+        self.pages = []
+
+        for i in range(doc.page_count):
+            text = doc.load_page(i).get_text("text") or ""
+            self.pages.append({
+                "page_index": i,
+                "page_number": i + 1,
+                "text": text
+            })
+
+        doc.close()
+        print(f"  → Extracted {len(self.pages)} pages")
+        return self.pages
+
+    def find_law_starts_from_toc(self, max_scan_pages: int = 25) -> Dict[int, Dict[str, Any]]:
+        """Parse TOC to find law start pages"""
+        law_starts = {}
+        contents_found = False
+
+        scan_pages = self.pages[:min(len(self.pages), max_scan_pages)]
+
+        for page in scan_pages:
+            text = page["text"]
+
+            if not contents_found:
+                if re.search(r"(?i)\bContents\b", text):
+                    contents_found = True
+
+            if not contents_found:
+                continue
+
+            for line in text.split("\n"):
+                line = line.strip()
+                m = self.TOC_LINE_RE.match(line)
+                if not m:
+                    continue
+
+                law_num = int(m.group(1))
+                title = m.group(2).strip()
+                start_page = int(m.group(3))
+
+                if 1 <= law_num <= 17 and law_num not in law_starts:
+                    law_starts[law_num] = {
+                        "title": title,
+                        "start_page": start_page
+                    }
+
+        return law_starts
+
+    def find_law_starts_from_headers(self) -> Dict[int, Dict[str, Any]]:
+        """Fallback: detect starts from body headers"""
+        law_starts = {}
+
+        for page in self.pages:
+            for line in page["text"].split("\n"):
+                line = line.strip()
+                m = self.BODY_HEADER_RE.match(line)
+                if m:
+                    law_num = int(m.group(1))
+                    title = m.group(2).strip()
+                    start_page = int(m.group(3)) if m.group(3) else page["page_number"]
+
+                    if 1 <= law_num <= 17 and law_num not in law_starts:
+                        law_starts[law_num] = {
+                            "title": title,
+                            "start_page": start_page
+                        }
+
+        return law_starts
+
+    def extract_laws(self) -> Dict[int, Dict[str, Any]]:
+        """Extract all 17 laws"""
+        # Try TOC first
+        law_starts = self.find_law_starts_from_toc()
+
+        # Fallback to headers if TOC incomplete
+        if len(law_starts) < 10:
+            print("  → TOC incomplete, using body headers...")
+            law_starts = self.find_law_starts_from_headers()
+
+        if not law_starts:
+            raise RuntimeError("Could not detect law start pages")
+
+        # Sort by page number
+        starts_sorted = sorted(
+            [(ln, info["start_page"], info["title"])
+             for ln, info in law_starts.items()],
+            key=lambda x: x[1]
+        )
+
+        laws = {}
+        page_count = len(self.pages)
+
+        for idx, (law_num, start_page, title) in enumerate(starts_sorted):
+            # Determine end page
+            next_start = starts_sorted[idx + 1][1] if idx + 1 < len(starts_sorted) else (page_count + 1)
+            end_page = next_start - 1
+
+            # Convert to 0-based indexes
+            start_i = max(0, start_page - 1)
+            end_i = min(page_count - 1, end_page - 1)
+
+            # Concatenate pages
+            chunk_pages = self.pages[start_i:end_i + 1]
+            combined = "\n\n".join([p["text"] for p in chunk_pages])
+
+            laws[law_num] = {
+                "law_number": law_num,
+                "title": title,
+                "page_start": start_page,
+                "page_end": end_page,
+                "raw_text": combined,
+            }
+
+        print(f"  → Extracted {len(laws)}/17 laws")
+        if len(laws) < 17:
+            missing = set(range(1, 18)) - set(laws.keys())
+            print(f"  → WARNING: Missing laws: {sorted(missing)}")
+
+        return laws
+
+
+# ============================================================================
+# STEP 2: SPLIT INTO SUBSECTIONS
+# ============================================================================
+
+class SubsectionParser:
+    """Parse laws into subsections with introductions"""
+
+    # Matches subsection headings like: "1. Field surface"
+    SUBSECTION_RE = re.compile(r"(?m)^\s*(\d{1,2})\.\s+([^\n]+?)\s*$")
+
+    # Header/footer to remove
+    HEADER_FOOTER_RE = re.compile(
+        r"(?im)^\s*Laws?\s+of\s+the\s+Game\s+2025/26\s*\|\s*Law\s*\d{1,2}\s*\|\s*.+?\s*$"
+    )
+
+    # Page numbers
+    PAGE_ONLY_RE = re.compile(r"(?m)^\s*\d{1,3}\s*$")
+
+    # Appendix markers - must be clear section headers with newlines, not words in text
+    APPENDIX_HEADER_PATTERNS = [
+        re.compile(r'\n\s*video\s+assistant\s+referee\s*\(?\s*var\s*\)?\s*protocol\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*var\s+protocol\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*practical\s+guidelines\s+for\s+match\s+officials\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*fifa\s+quality\s+programme\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*glossary\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*football\s+terms\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*law\s+changes\s+\d{4}/\d{2}\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*details\s+of\s+all\s+law\s+changes\s*\n', re.IGNORECASE),
+        re.compile(r'\n\s*notes\s+and\s+modifications\s*\n', re.IGNORECASE),
+    ]
+
+    def __init__(self, config: ChunkConfig):
         self.config = config
 
-    def extract_full_text(self) -> str:
-        """Extract complete text from PDF"""
-        try:
-            result = subprocess.run(
-                ['pdftotext', '-layout', str(self.pdf_path), '-'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return result.stdout
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to extract PDF text: {e}")
+    def cut_at_appendix(self, text: str) -> str:
+        """Remove everything after appendix section headers (not just keywords in text)"""
+        earliest_cut = len(text)
+
+        for pattern in self.APPENDIX_HEADER_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                earliest_cut = min(earliest_cut, match.start())
+
+        if earliest_cut < len(text):
+            return text[:earliest_cut].strip()
+        return text
 
     def clean_text(self, text: str) -> str:
         """Clean extracted text"""
         if not text:
             return ""
 
-        # Normalize whitespace
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        text = re.sub(r'\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
-        text = re.sub(r'\u0007', ' ', text)
+        # Remove control characters
+        text = text.replace("\u0007", " ")
+        text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", " ", text)
 
-        # Fix common PDF extraction issues
-        text = text.replace('â€¢', '•')
-        text = text.replace('â€"', '–')
-        text = text.replace('â€™', "'")
-        text = text.replace('\u2022', '•')
-        text = text.replace('\u2013', '-')
-        text = text.replace('\u2014', '-')
+        # Normalize newlines
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-        # Remove page numbers and headers/footers
-        if self.config.remove_headers_footers:
-            text = re.sub(r'(?m)^Laws of the Game 2025/26.*$', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'(?m)^\s*\d{1,3}\s*$', '', text)
-            text = re.sub(r'(?m)^Law \d+\s*\|.*$', '', text, flags=re.IGNORECASE)
+        # Remove headers/footers
+        text = self.HEADER_FOOTER_RE.sub("", text)
+        text = self.PAGE_ONLY_RE.sub("", text)
 
-        # Normalize spaces and newlines
+        # Collapse whitespace
         lines = []
-        for line in text.split('\n'):
-            line = re.sub(r'[ \t]{2,}', ' ', line).strip()
+        for line in text.split("\n"):
+            line = re.sub(r"[ \t]+", " ", line).strip()
             if line:
                 lines.append(line)
 
-        text = '\n'.join(lines)
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = "\n".join(lines)
+        text = re.sub(r"\n{3,}", "\n\n", text)
 
         return text.strip()
 
-
-class LawParser:
-    """Parse the full text into law sections"""
-
-    def __init__(self, config: ChunkConfig):
-        self.config = config
-
-    def find_law_start_positions(self, text: str) -> Dict[int, int]:
-        """
-        Find the starting position of each law in the text.
-        Returns {law_number: text_position}
-        """
-        positions = {}
-
-        # Pattern to match law headers: "Law 1 – The Field of Play" or just "1" followed by law title
-        patterns = [
-            re.compile(r'\n\s*Law\s+(\d{1,2})\s*[-–—]\s*The\s+([^\n]+)', re.IGNORECASE),
-            re.compile(r'\n\s*(\d{1,2})\s*\n\s*Law\s*\n', re.IGNORECASE),
-            re.compile(r'\n\s*The\s+(Field of Play|Ball|Players|Players\' Equipment|Referee|'
-                      r'Other Match Officials|Duration of the Match|Start and Restart of Play|'
-                      r'Ball in and out of Play|Determining the Outcome|Offside|Fouls and Misconduct|'
-                      r'Free Kicks|Penalty Kick|Throw-in|Goal Kick|Corner Kick)\s*\n', re.IGNORECASE)
+    def is_critical_intro(self, text: str) -> bool:
+        """Check if intro contains critical phrases"""
+        critical_phrases = [
+            'goal may be scored',
+            'goal cannot be scored',
+            'cannot be scored directly',
+            'may be scored directly',
+            'ball is out of play',
+            'ball is in play',
+            'touches a match official',
+            'awarded when',
+            'awarded if',
         ]
-
-        # Try to match each pattern
-        for law_num, law_info in LAW_STRUCTURE.items():
-            # Look for "Law X - Title" format
-            pattern1 = re.compile(
-                rf'\n\s*Law\s+{law_num}\s*[-–—]\s*{re.escape(law_info["title"])}\s*\n',
-                re.IGNORECASE
-            )
-            match = pattern1.search(text)
-            if match:
-                positions[law_num] = match.start()
-                continue
-
-            # Look for just the title after a law number
-            pattern2 = re.compile(
-                rf'\n\s*{law_num}\s*\n\s*{re.escape(law_info["title"])}\s*\n',
-                re.IGNORECASE
-            )
-            match = pattern2.search(text)
-            if match:
-                positions[law_num] = match.start()
-                continue
-
-            # Look for just the title
-            pattern3 = re.compile(
-                rf'\n\s*{re.escape(law_info["title"])}\s*\n',
-                re.IGNORECASE
-            )
-            match = pattern3.search(text)
-            if match and law_num not in positions:
-                # Make sure it's not just a random mention
-                context = text[max(0, match.start()-50):match.end()+50]
-                if law_num not in positions:  # Only use if we haven't found it yet
-                    positions[law_num] = match.start()
-
-        return positions
-
-    def cut_at_appendix(self, text: str) -> str:
-        """Remove everything after appendix markers"""
         text_lower = text.lower()
-        earliest_cut = len(text)
+        return any(phrase in text_lower for phrase in critical_phrases)
 
-        for marker in APPENDIX_MARKERS:
-            pos = text_lower.find(marker)
-            if pos != -1:
-                earliest_cut = min(earliest_cut, pos)
+    def parse_law(self, law: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Split law into subsections"""
+        law_num = law["law_number"]
+        law_title = law["title"]
+        page_start = law["page_start"]
+        page_end = law["page_end"]
 
-        if earliest_cut < len(text):
-            return text[:earliest_cut]
-        return text
+        # First cut at appendix markers, then clean
+        raw_text = self.cut_at_appendix(law["raw_text"])
+        text = self.clean_text(raw_text)
 
-    def extract_law_text(self, text: str, law_num: int, start_pos: int,
-                        next_start: Optional[int]) -> str:
-        """Extract text for a specific law"""
-        if next_start:
-            law_text = text[start_pos:next_start]
-        else:
-            law_text = text[start_pos:]
-
-        # Cut at appendix
-        law_text = self.cut_at_appendix(law_text)
-
-        return law_text.strip()
-
-    def parse_subsections(self, law_num: int, law_text: str) -> List[Dict[str, Any]]:
-        """
-        Parse subsections from law text.
-        Returns list of dictionaries with intro as subsection 0.
-        """
-        law_info = LAW_STRUCTURE[law_num]
-        law_title = law_info['title']
-
-        # Remove the law header
-        law_text = re.sub(
-            rf'^\s*Law\s+{law_num}\s*[-–—]?\s*{re.escape(law_title)}\s*\n',
-            '',
-            law_text,
-            count=1,
-            flags=re.IGNORECASE
-        )
-        law_text = re.sub(rf'^\s*{law_num}\s*\n\s*{re.escape(law_title)}\s*\n', '', law_text, count=1, flags=re.IGNORECASE)
-        law_text = re.sub(rf'^\s*{re.escape(law_title)}\s*\n', '', law_text, count=1, flags=re.IGNORECASE)
-        law_text = re.sub(rf'^\s*{law_num}\s*\n', '', law_text, count=1)
+        # Find subsection headings
+        matches = list(self.SUBSECTION_RE.finditer(text))
 
         sections = []
 
-        # Find all numbered subsections: "1. Procedure", "2. Offences and sanctions", etc.
-        subsection_pattern = re.compile(r'^\s*(\d{1,2})\.\s+([^\n]{3,80})\s*$', re.MULTILINE)
-        matches = list(subsection_pattern.finditer(law_text))
-
-        # Extract introduction (everything before first subsection)
+        # Extract introduction (before first subsection)
         if matches:
-            intro_text = law_text[:matches[0].start()].strip()
+            intro_text = text[:matches[0].start()].strip()
 
-            # Clean up intro
-            intro_text = re.sub(r'^\s*\d{1,2}\s*\n', '', intro_text)
-            intro_text = intro_text.strip()
-
-            # Only include if substantial
-            if len(intro_text) >= self.config.min_chunk_chars:
+            # Check if intro is substantial or critical
+            if intro_text and (len(intro_text) >= self.config.min_intro_chars or
+                              self.is_critical_intro(intro_text)):
                 sections.append({
-                    'law_number': law_num,
-                    'law_title': law_title,
-                    'subsection_number': 0,
-                    'subsection_title': 'Introduction',
-                    'text': intro_text,
-                    'is_introduction': True,
+                    "law_number": law_num,
+                    "law_title": law_title,
+                    "subsection_number": 0,
+                    "subsection_title": "Introduction",
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "text": intro_text,
+                    "is_introduction": True,
                 })
+                print(f"    → Law {law_num}: Added intro ({len(intro_text)} chars, "
+                      f"critical={self.is_critical_intro(intro_text)})")
+            elif not intro_text:
+                # No intro text - law starts immediately with subsection 1
+                # This is fine (e.g., Law 9)
+                pass
 
-        # Extract numbered subsections
+        # Extract numbered subsections (with limit)
         for i, match in enumerate(matches):
-            try:
-                sub_num = int(match.group(1))
-                sub_title = match.group(2).strip()
+            # Safety: stop if we've exceeded reasonable limit
+            if i >= self.config.max_subsections_per_law:
+                print(f"    → WARNING: Law {law_num} has {len(matches)} subsections, "
+                      f"limiting to {self.config.max_subsections_per_law}")
+                break
 
-                # Validate subsection number
-                if sub_num < 1 or sub_num > law_info['max_subsections']:
-                    continue
+            sub_num = int(match.group(1))
+            sub_title = match.group(2).strip()
 
-                # Get text until next subsection or end
-                start = match.end()
-                if i + 1 < len(matches):
-                    end = matches[i + 1].start()
-                else:
-                    end = len(law_text)
+            start_idx = match.start()
+            end_idx = matches[i + 1].start() if i + 1 < len(matches) else len(text)
 
-                section_text = law_text[start:end].strip()
+            chunk_text = text[start_idx:end_idx].strip()
 
-                # Skip if too short
-                if len(section_text) < self.config.min_chunk_chars:
-                    continue
-
-                # Cut at appendix markers
-                section_text = self.cut_at_appendix(section_text)
-
-                if len(section_text) < self.config.min_chunk_chars:
-                    continue
-
-                sections.append({
-                    'law_number': law_num,
-                    'law_title': law_title,
-                    'subsection_number': sub_num,
-                    'subsection_title': sub_title,
-                    'text': section_text,
-                    'is_introduction': False,
-                })
-
-            except (ValueError, IndexError):
+            if len(chunk_text) < self.config.min_chunk_chars:
                 continue
+
+            sections.append({
+                "law_number": law_num,
+                "law_title": law_title,
+                "subsection_number": sub_num,
+                "subsection_title": sub_title,
+                "page_start": page_start,
+                "page_end": page_end,
+                "text": chunk_text,
+                "is_introduction": False,
+            })
+
+        # If no subsections found, treat entire law as one section
+        if not sections:
+            sections.append({
+                "law_number": law_num,
+                "law_title": law_title,
+                "subsection_number": 1,
+                "subsection_title": "Complete Law",
+                "page_start": page_start,
+                "page_end": page_end,
+                "text": text,
+                "is_introduction": False,
+            })
 
         return sections
 
 
 # ============================================================================
-# SUB-CHUNKING
+# STEP 3: SUB-CHUNKING
 # ============================================================================
 
 class SubChunker:
-    """Create semantic sub-chunks from large sections"""
+    """Split large sections into smaller chunks"""
 
     def __init__(self, config: ChunkConfig):
         self.config = config
 
     def estimate_tokens(self, text: str) -> int:
-        """Rough token estimation"""
         return int(len(text.split()) * 1.3)
 
     def should_subchunk(self, text: str) -> bool:
-        """Determine if text should be sub-chunked"""
         if not self.config.enable_subchunking:
             return False
         tokens = self.estimate_tokens(text)
         return tokens > self.config.target_tokens * 1.5
 
     def create_subchunks(self, chunk: LawChunk) -> List[LawChunk]:
-        """Split a chunk into smaller sub-chunks with overlap"""
+        """Split chunk into sub-chunks with overlap"""
         if not self.should_subchunk(chunk.text):
             return [chunk]
 
         text = chunk.text
-        lines = text.split('\n')
+        words = text.split()
 
-        # Extract heading if present
-        heading = ""
-        body = text
-
-        if lines and len(lines[0]) < 100:
-            heading_match = re.match(r'^(\d+)\.\s+(.+)$', lines[0])
-            if heading_match:
-                heading = lines[0]
-                body = '\n'.join(lines[1:]).strip()
-
-        # Split by words
-        words = body.split()
         if not words:
             return [chunk]
 
@@ -423,10 +456,6 @@ class SubChunker:
             end = min(len(words), start + target)
             chunk_words = words[start:end]
             chunk_text = ' '.join(chunk_words)
-
-            # Prepend heading for context
-            if heading:
-                chunk_text = f"{heading}\n{chunk_text}"
 
             subchunk = LawChunk(
                 chunk_id=f"{chunk.chunk_id}_s{idx:02d}",
@@ -455,33 +484,31 @@ class SubChunker:
 
 
 # ============================================================================
-# EMBEDDING GENERATION
+# STEP 4: EMBEDDING GENERATION
 # ============================================================================
 
 class EmbeddingGenerator:
-    """Generate embeddings using sentence-transformers"""
+    """Generate embeddings"""
 
     def __init__(self, config: ChunkConfig):
         self.config = config
         self.model = None
 
     def load_model(self):
-        """Load the embedding model"""
         if not EMBEDDINGS_AVAILABLE:
             raise RuntimeError("sentence-transformers not installed")
 
-        print(f"Loading embedding model: {self.config.embedding_model}")
+        print(f"  Loading model: {self.config.embedding_model}")
         self.model = SentenceTransformer(self.config.embedding_model)
-        print("Model loaded successfully")
+        print("  Model loaded")
 
     def generate_embeddings(self, chunks: List[LawChunk]) -> np.ndarray:
-        """Generate embeddings for all chunks"""
         if self.model is None:
             self.load_model()
 
         texts = [chunk.text for chunk in chunks]
 
-        print(f"Generating embeddings for {len(texts)} chunks...")
+        print(f"  Generating embeddings for {len(texts)} chunks...")
 
         try:
             from tqdm import tqdm
@@ -494,7 +521,7 @@ class EmbeddingGenerator:
             batch_size=self.config.batch_size,
             show_progress_bar=show_progress,
             convert_to_numpy=True,
-            normalize_embeddings=self.config.normalize_embeddings,
+            normalize_embeddings=True,
         )
 
         return embeddings.astype('float32')
@@ -505,7 +532,7 @@ class EmbeddingGenerator:
 # ============================================================================
 
 class LawsChunkerPipeline:
-    """Complete end-to-end chunking pipeline"""
+    """Complete pipeline"""
 
     def __init__(self, pdf_path: Path, output_dir: Path, config: ChunkConfig):
         self.pdf_path = pdf_path
@@ -518,60 +545,42 @@ class LawsChunkerPipeline:
         self.embeddings_file = output_dir / "embeddings.npy"
         self.stats_file = output_dir / "chunking_stats.json"
 
-    def run(self) -> Tuple[List[LawChunk], Optional[np.ndarray]]:
-        """Execute the complete pipeline"""
-
+    def run(self):
+        """Execute pipeline"""
         print("=" * 80)
-        print("FIFA LAWS OF THE GAME - CHUNKING & EMBEDDING PIPELINE")
+        print("FIFA LAWS CHUNKER - FINAL WORKING VERSION")
         print("=" * 80)
         print(f"PDF: {self.pdf_path}")
         print(f"Output: {self.output_dir}")
-        print(f"Sub-chunking: {'Enabled' if self.config.enable_subchunking else 'Disabled'}")
-        print(f"Embeddings: {'Enabled' if not self.config.skip_embeddings else 'Disabled'}")
         print("=" * 80)
 
-        # Step 1: Extract text from PDF
-        print("\n[1/4] Extracting text from PDF...")
-        extractor = PDFTextExtractor(self.pdf_path, self.config)
-        full_text = extractor.extract_full_text()
-        cleaned_text = extractor.clean_text(full_text)
-        print(f"  → Extracted {len(cleaned_text):,} characters")
+        # Step 1: Extract laws from PDF
+        print("\n[1/4] Extracting laws from PDF...")
+        extractor = LawExtractor(self.pdf_path)
+        extractor.extract_pages()
+        laws = extractor.extract_laws()
 
-        # Step 2: Parse into laws and sections
-        print("\n[2/4] Parsing laws and sections...")
-        parser = LawParser(self.config)
-        positions = parser.find_law_start_positions(cleaned_text)
-        print(f"  → Found {len(positions)} laws")
-
+        # Step 2: Parse into subsections
+        print("\n[2/4] Parsing subsections...")
+        parser = SubsectionParser(self.config)
         all_sections = []
-        sorted_laws = sorted(positions.items())
 
-        for i, (law_num, start_pos) in enumerate(sorted_laws):
-            # Get next law start or end of text
-            next_start = sorted_laws[i + 1][1] if i + 1 < len(sorted_laws) else None
-
-            # Extract law text
-            law_text = parser.extract_law_text(cleaned_text, law_num, start_pos, next_start)
-
-            # Parse subsections
-            sections = parser.parse_subsections(law_num, law_text)
+        for law_num in sorted(laws.keys()):
+            sections = parser.parse_law(laws[law_num])
             all_sections.extend(sections)
 
-            intro_count = sum(1 for s in sections if s.get('is_introduction', False))
+            intro_count = sum(1 for s in sections if s.get('is_introduction'))
             subsection_count = len(sections) - intro_count
-            print(f"  → Law {law_num:2d}: {intro_count} intro + {subsection_count} subsections = {len(sections)} total")
+            print(f"  → Law {law_num:2d}: {intro_count} intro + {subsection_count} subsections")
 
         print(f"\n  Total sections: {len(all_sections)}")
 
         # Step 3: Create chunks with sub-chunking
-        print("\n[3/4] Creating chunks and sub-chunks...")
+        print("\n[3/4] Creating chunks...")
+        chunker = SubChunker(self.config)
         chunks = []
-        subchunker = SubChunker(self.config)
 
         for section in all_sections:
-            # Estimate page numbers (rough)
-            page_num = section['law_number'] * 5  # Rough estimate
-
             chunk_id = f"law{section['law_number']:02d}_sec{section['subsection_number']:02d}"
             chunk = LawChunk(
                 chunk_id=chunk_id,
@@ -580,20 +589,19 @@ class LawsChunkerPipeline:
                 subsection_number=section['subsection_number'],
                 subsection_title=section['subsection_title'],
                 text=section['text'],
-                page_start=page_num,
-                page_end=page_num + 2,
+                page_start=section['page_start'],
+                page_end=section['page_end'],
                 char_count=len(section['text']),
                 is_introduction=section.get('is_introduction', False),
             )
 
-            # Apply sub-chunking
-            subchunks = subchunker.create_subchunks(chunk)
+            subchunks = chunker.create_subchunks(chunk)
             chunks.extend(subchunks)
 
-        print(f"  → Created {len(chunks)} total chunks")
+        print(f"  → Created {len(chunks)} chunks")
         subchunk_count = sum(1 for c in chunks if c.is_subchunk)
         intro_count = sum(1 for c in chunks if c.is_introduction)
-        print(f"  → Includes {intro_count} introductions and {subchunk_count} sub-chunks")
+        print(f"  → {intro_count} introductions, {subchunk_count} sub-chunks")
 
         # Save chunks
         self._save_chunks(chunks)
@@ -605,58 +613,46 @@ class LawsChunkerPipeline:
             try:
                 generator = EmbeddingGenerator(self.config)
                 embeddings = generator.generate_embeddings(chunks)
-                print(f"  → Generated embeddings with shape: {embeddings.shape}")
+                print(f"  → Shape: {embeddings.shape}")
                 self._save_embeddings(embeddings)
             except Exception as e:
-                print(f"  ✗ Failed to generate embeddings: {e}")
-                print("  → Continuing without embeddings")
+                print(f"  ✗ Failed: {e}")
         else:
-            print("\n[4/4] Skipping embeddings (disabled or not available)")
+            print("\n[4/4] Skipping embeddings")
 
         # Save stats
-        self._save_stats(chunks, embeddings)
+        self._save_stats(chunks, embeddings, laws)
 
         print("\n" + "=" * 80)
-        print("PIPELINE COMPLETE")
+        print("✅ COMPLETE")
         print("=" * 80)
-        print(f"Chunks:     {self.chunks_file} ({len(chunks)} chunks)")
+        print(f"Chunks: {self.chunks_file} ({len(chunks)} chunks)")
         if embeddings is not None:
             print(f"Embeddings: {self.embeddings_file} (shape: {embeddings.shape})")
-        print(f"Stats:      {self.stats_file}")
+        print(f"Stats: {self.stats_file}")
         print("=" * 80)
-
-        # Show sample chunks
-        print("\nSample chunks:")
-        for i, chunk in enumerate(chunks[:3]):
-            print(f"\n{i+1}. {chunk.chunk_id}")
-            print(f"   Law {chunk.law_number}: {chunk.law_title}")
-            print(f"   Subsection {chunk.subsection_number}: {chunk.subsection_title}")
-            print(f"   Text preview: {chunk.text[:100]}...")
 
         return chunks, embeddings
 
     def _save_chunks(self, chunks: List[LawChunk]):
-        """Save chunks to JSONL"""
         with open(self.chunks_file, 'w', encoding='utf-8') as f:
             for chunk in chunks:
                 json.dump(chunk.to_dict(), f, ensure_ascii=False)
                 f.write('\n')
-        print(f"\n  → Saved {len(chunks)} chunks to {self.chunks_file}")
+        print(f"  → Saved to {self.chunks_file}")
 
     def _save_embeddings(self, embeddings: np.ndarray):
-        """Save embeddings to NPY"""
         np.save(self.embeddings_file, embeddings)
-        print(f"  → Saved embeddings to {self.embeddings_file}")
+        print(f"  → Saved to {self.embeddings_file}")
 
-    def _save_stats(self, chunks: List[LawChunk], embeddings: Optional[np.ndarray]):
-        """Save statistics"""
+    def _save_stats(self, chunks: List[LawChunk], embeddings: Optional[np.ndarray], laws: Dict):
+        from collections import defaultdict
+
         law_chunks = defaultdict(int)
-        law_subsections = defaultdict(set)
         law_intros = defaultdict(int)
 
         for chunk in chunks:
             law_chunks[chunk.law_number] += 1
-            law_subsections[chunk.law_number].add(chunk.subsection_number)
             if chunk.is_introduction:
                 law_intros[chunk.law_number] += 1
 
@@ -664,17 +660,12 @@ class LawsChunkerPipeline:
             'total_chunks': len(chunks),
             'total_subchunks': sum(1 for c in chunks if c.is_subchunk),
             'total_introductions': sum(1 for c in chunks if c.is_introduction),
+            'laws_found': sorted(list(laws.keys())),
+            'laws_missing': sorted(list(set(range(1, 18)) - set(laws.keys()))),
             'embedding_dimension': embeddings.shape[1] if embeddings is not None else None,
             'chunks_per_law': dict(sorted(law_chunks.items())),
-            'subsections_per_law': {k: len(v) for k, v in sorted(law_subsections.items())},
             'introductions_per_law': dict(sorted(law_intros.items())),
             'avg_chunk_length': int(np.mean([c.char_count for c in chunks])),
-            'config': {
-                'target_tokens': self.config.target_tokens,
-                'overlap_tokens': self.config.overlap_tokens,
-                'min_chunk_chars': self.config.min_chunk_chars,
-                'embedding_model': self.config.embedding_model,
-            }
         }
 
         with open(self.stats_file, 'w', encoding='utf-8') as f:
@@ -687,66 +678,47 @@ class LawsChunkerPipeline:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Complete chunking and embedding pipeline for FIFA Laws of the Game',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic usage
-  python laws_chunker_standalone.py Laws_of_the_Game_2025_26.pdf
-  
-  # Custom output directory
-  python laws_chunker_standalone.py Laws_of_the_Game_2025_26.pdf -o ./my_chunks
-  
-  # Disable sub-chunking
-  python laws_chunker_standalone.py Laws_of_the_Game_2025_26.pdf --no-subchunk
-  
-  # Skip embeddings (chunks only)
-  python laws_chunker_standalone.py Laws_of_the_Game_2025_26.pdf --no-embeddings
-        """
+        description='Final working chunker for FIFA Laws'
     )
 
-    parser.add_argument('pdf_path', type=Path, help='Path to the Laws of the Game PDF')
+    parser.add_argument('pdf_path', type=Path, help='Path to PDF')
     parser.add_argument('-o', '--output-dir', type=Path, default=Path('./rag_chunks'),
                        help='Output directory (default: ./rag_chunks)')
-
-    # Chunking options
     parser.add_argument('--no-subchunk', action='store_true',
                        help='Disable sub-chunking')
-    parser.add_argument('--target-tokens', type=int, default=170,
-                       help='Target tokens per sub-chunk (default: 170)')
-    parser.add_argument('--overlap', type=int, default=35,
-                       help='Overlap tokens between sub-chunks (default: 35)')
-    parser.add_argument('--min-chunk-chars', type=int, default=80,
-                       help='Minimum characters per chunk (default: 80)')
-
-    # Embedding options
     parser.add_argument('--no-embeddings', action='store_true',
-                       help='Skip embedding generation')
-    parser.add_argument('--embedding-model', type=str,
-                       default='sentence-transformers/all-MiniLM-L6-v2',
-                       help='Embedding model name')
+                       help='Skip embeddings')
+    parser.add_argument('--min-intro-chars', type=int, default=30,
+                       help='Min chars for intro (default: 30)')
 
     args = parser.parse_args()
 
-    # Validate
     if not args.pdf_path.exists():
-        print(f"Error: PDF file not found: {args.pdf_path}")
+        print(f"Error: PDF not found: {args.pdf_path}")
         return 1
 
-    # Create config
+    if not PYMUPDF_AVAILABLE:
+        print("Error: PyMuPDF not installed. Run: pip install pymupdf")
+        return 1
+
     config = ChunkConfig(
         enable_subchunking=not args.no_subchunk,
-        target_tokens=args.target_tokens,
-        overlap_tokens=args.overlap,
-        min_chunk_chars=args.min_chunk_chars,
-        embedding_model=args.embedding_model,
         skip_embeddings=args.no_embeddings,
+        min_intro_chars=args.min_intro_chars,
     )
 
-    # Run pipeline
     try:
         pipeline = LawsChunkerPipeline(args.pdf_path, args.output_dir, config)
         chunks, embeddings = pipeline.run()
+
+        # Final check
+        laws_found = set(c.law_number for c in chunks)
+        if len(laws_found) == 17:
+            print("\n✅ SUCCESS: All 17 laws found!")
+        else:
+            missing = set(range(1, 18)) - laws_found
+            print(f"\n⚠️ WARNING: Missing laws {sorted(missing)}")
+
         return 0
     except Exception as e:
         print(f"\nError: {e}")
