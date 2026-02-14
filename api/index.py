@@ -1,6 +1,7 @@
 """
 Enhanced Football Laws of the Game RAG API
 Version 2.4 - MongoDB Integration for Persistent Query Counter
+IMPROVED: Better handling of unanswerable questions
 """
 import os
 import json
@@ -559,11 +560,18 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
     scenario_text = "\n".join(scenario_hints) if scenario_hints else "General scenario."
 
     system_instruction = (
-        "You are a Laws of the Game (football/soccer) assistant.\n"
-        "You MUST answer using ONLY the provided EXTRACTS.\n"
-        "If any part of the answer is not clearly supported by the extracts, write:\n"
-        "\"Not found in the provided extracts\" for that part.\n\n"
-        "For every answer, follow this structure exactly:\n\n"
+        "You are a friendly and helpful Laws of the Game (football/soccer) assistant.\n"
+        "You MUST answer using ONLY the provided EXTRACTS.\n\n"
+        "HANDLING UNANSWERABLE QUESTIONS:\n"
+        "If the question cannot be answered from the extracts, respond professionally:\n\n"
+        "\"I don't have enough information in the Laws of the Game extracts to answer that specific question. "
+        "This could be because:\n"
+        "• The scenario might fall outside the official Laws of the Game\n"
+        "• The question may require interpretation beyond what's explicitly written\n"
+        "• The relevant section might not have been retrieved in my search\n\n"
+        "Feel free to rephrase your question or ask about a related topic. I'm here to help with any questions "
+        "about the official Laws of the Game!\"\n\n"
+        "For answerable questions, follow this structure exactly:\n\n"
         "1) Answer (Direct response to the question)\n"
         "   - Decision: [What should happen - be specific to the scenario]\n"
         "   - Restart: [Specify the exact restart based on the situation]\n"
@@ -574,6 +582,9 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "   - Evidence: [Provide 1–2 short quotes]\n"
         "   - Citation: [Include the exact CITATION line after each quote]\n\n"
         "Rules:\n"
+        "- Be friendly, helpful, and encouraging in all responses\n"
+        "- Never make users feel their question was invalid or stupid\n"
+        "- If you cannot find clear support in the extracts, gracefully use the unanswerable format\n"
         "- Lead with the ANSWER - what actually happens in this scenario\n"
         "- Then provide the legal basis and evidence\n"
         "- Do not invent Laws, restarts, or cards.\n"
@@ -670,8 +681,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Optimized for proper chunking with all laws - MongoDB persistent storage",
-    version="2.4.0",
+    description="Optimized for proper chunking with all laws - MongoDB persistent storage - Improved UX",
+    version="2.4.1",
     lifespan=lifespan,
 )
 
@@ -688,7 +699,8 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.4.0",
+        "version": "2.4.1",
+        "improvements": "Enhanced error handling for better user experience",
         "storage": "MongoDB Atlas",
         "endpoints": {
             "/ask": "POST - Ask a question",
