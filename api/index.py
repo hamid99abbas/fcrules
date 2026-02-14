@@ -1,6 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.3 - Optimized for Proper Chunking
+Version 2.4 - MongoDB Integration for Persistent Query Counter
 """
 import os
 import json
@@ -15,6 +15,8 @@ import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
 from huggingface_hub import InferenceClient
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, OperationFailure
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,9 +38,10 @@ TOP_K = 10
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
-# persistent query counter
-COUNTER_FILE_PATH = BASE_DIR / "query_counter.json"
-COUNTER_KEY = "all_time_queries"
+# MongoDB configuration
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "fcrules")
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "query_stats")
 
 # API keys from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -48,6 +51,8 @@ if not HF_TOKEN:
     print("Warning: HF_TOKEN not found in environment variables")
 if not GEMINI_API_KEY:
     print("Warning: GEMINI_API_KEY not found in environment variables")
+if not MONGODB_URI:
+    print("Warning: MONGODB_URI not found in environment variables")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +60,136 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fcrules.api")
 counter_lock = threading.Lock()
+
+# -----------------------------
+# MONGODB CLIENT
+# -----------------------------
+class MongoDBCounter:
+    """Thread-safe MongoDB-backed counter for query tracking"""
+
+    def __init__(self, uri: str, database: str, collection: str):
+        self.uri = uri
+        self.database_name = database
+        self.collection_name = collection
+        self.client: Optional[MongoClient] = None
+        self.db = None
+        self.collection = None
+        self._connected = False
+
+    def connect(self):
+        """Establish connection to MongoDB"""
+        try:
+            self.client = MongoClient(
+                self.uri,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                retryWrites=True
+            )
+            # Test connection
+            self.client.admin.command('ping')
+
+            self.db = self.client[self.database_name]
+            self.collection = self.db[self.collection_name]
+            self._connected = True
+
+            # Initialize counter document if it doesn't exist
+            result = self.collection.find_one({"_id": "query_counter"})
+            if result is None:
+                self.collection.insert_one({
+                    "_id": "query_counter",
+                    "count": 0,
+                    "last_updated": time.time()
+                })
+                logger.info("Initialized new query counter in MongoDB")
+            else:
+                logger.info("Connected to MongoDB. Current count: %s", result.get("count", 0))
+
+            return True
+
+        except ConnectionFailure as e:
+            logger.error("Failed to connect to MongoDB: %s", e)
+            self._connected = False
+            return False
+        except Exception as e:
+            logger.error("Unexpected error connecting to MongoDB: %s", e)
+            self._connected = False
+            return False
+
+    def is_connected(self) -> bool:
+        """Check if MongoDB connection is active"""
+        if not self._connected or self.client is None:
+            return False
+        try:
+            self.client.admin.command('ping')
+            return True
+        except:
+            self._connected = False
+            return False
+
+    def get_count(self) -> int:
+        """Get current query count from MongoDB"""
+        if not self.is_connected():
+            logger.warning("MongoDB not connected. Attempting to reconnect...")
+            if not self.connect():
+                logger.error("Failed to reconnect to MongoDB")
+                return 0
+
+        try:
+            result = self.collection.find_one({"_id": "query_counter"})
+            if result:
+                return int(result.get("count", 0))
+            return 0
+        except Exception as e:
+            logger.error("Error reading count from MongoDB: %s", e)
+            return 0
+
+    def increment(self) -> tuple[int, bool]:
+        """
+        Increment counter and return (new_count, success)
+        Thread-safe with MongoDB atomic operations
+        """
+        if not self.is_connected():
+            logger.warning("MongoDB not connected. Attempting to reconnect...")
+            if not self.connect():
+                logger.error("Failed to reconnect to MongoDB for increment")
+                return 0, False
+
+        try:
+            result = self.collection.find_one_and_update(
+                {"_id": "query_counter"},
+                {
+                    "$inc": {"count": 1},
+                    "$set": {"last_updated": time.time()}
+                },
+                return_document=True,
+                upsert=True
+            )
+
+            if result:
+                new_count = int(result.get("count", 0))
+                logger.info("Query counter incremented to: %s", new_count)
+                return new_count, True
+            else:
+                logger.error("Failed to increment counter - no result returned")
+                return 0, False
+
+        except OperationFailure as e:
+            logger.error("MongoDB operation failed during increment: %s", e)
+            return 0, False
+        except Exception as e:
+            logger.error("Unexpected error incrementing counter: %s", e)
+            return 0, False
+
+    def close(self):
+        """Close MongoDB connection"""
+        if self.client:
+            try:
+                self.client.close()
+                logger.info("MongoDB connection closed")
+            except Exception as e:
+                logger.error("Error closing MongoDB connection: %s", e)
+            finally:
+                self._connected = False
 
 # -----------------------------
 # PYDANTIC MODELS
@@ -83,6 +218,7 @@ class QuestionResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     retriever_loaded: bool
+    mongodb_connected: bool
     model: str
     embedding_model: str
     embedding_service: str
@@ -100,6 +236,7 @@ class StatsResponse(BaseModel):
     unique_laws: List[int]
     total_queries_processed: int
     intro_chunks_count: int
+    mongodb_connected: bool
 
 
 # -----------------------------
@@ -168,91 +305,6 @@ def load_embeddings(path: Path) -> np.ndarray:
     embeddings = np.load(path)
     print(f"Loaded embeddings with shape: {embeddings.shape}")
     return embeddings
-
-
-def load_query_counter_from_file() -> int:
-    if not COUNTER_FILE_PATH.exists():
-        logger.warning(
-            "Query counter file not found at %s. Creating a new counter with 0.",
-            COUNTER_FILE_PATH,
-        )
-        if not persist_query_counter_to_file(0):
-            logger.error("Failed to create query counter file during startup.")
-        return 0
-
-    try:
-        with COUNTER_FILE_PATH.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
-        counter_value = int(payload.get(COUNTER_KEY, 0))
-        if counter_value < 0:
-            raise ValueError(f"{COUNTER_KEY} must be >= 0, got {counter_value}")
-        logger.info("Loaded query counter from file: %s", counter_value)
-        return counter_value
-    except Exception:
-        logger.exception(
-            "Failed to load query counter from %s. Falling back to 0.",
-            COUNTER_FILE_PATH,
-        )
-        return 0
-
-
-def persist_query_counter_to_file(count: int) -> bool:
-    temp_path = COUNTER_FILE_PATH.with_suffix(".tmp")
-    payload = {COUNTER_KEY: int(count)}
-
-    try:
-        with temp_path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True)
-
-        os.replace(temp_path, COUNTER_FILE_PATH)
-
-        with COUNTER_FILE_PATH.open("r", encoding="utf-8") as f:
-            written_payload = json.load(f)
-        written_value = int(written_payload.get(COUNTER_KEY, -1))
-
-        if written_value != int(count):
-            logger.error(
-                "Query counter verification failed. expected=%s written=%s file=%s",
-                count,
-                written_value,
-                COUNTER_FILE_PATH,
-            )
-            return False
-
-        logger.info(
-            "Query counter updated successfully. value=%s file=%s",
-            written_value,
-            COUNTER_FILE_PATH,
-        )
-        return True
-    except Exception:
-        logger.exception(
-            "Failed to persist query counter. value=%s file=%s",
-            count,
-            COUNTER_FILE_PATH,
-        )
-        return False
-    finally:
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                logger.warning("Could not remove temporary counter file: %s", temp_path)
-
-
-def increment_and_persist_query_counter() -> tuple[int, bool]:
-    global query_count
-
-    with counter_lock:
-        query_count += 1
-        persisted = persist_query_counter_to_file(query_count)
-        if not persisted:
-            logger.error(
-                "Counter incremented in memory but failed to persist. in_memory=%s file=%s",
-                query_count,
-                COUNTER_FILE_PATH,
-            )
-        return query_count, persisted
 
 
 def format_citation(c: Dict[str, Any]) -> str:
@@ -552,17 +604,40 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
 # -----------------------------
 retriever: Optional[HybridRetriever] = None
 hf_client: Optional[HFEmbeddingClient] = None
+mongo_counter: Optional[MongoDBCounter] = None
 start_time = time.time()
-query_count = 0
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global retriever, hf_client, query_count
+    global retriever, hf_client, mongo_counter
+
+    # Initialize MongoDB counter
+    if MONGODB_URI:
+        try:
+            mongo_counter = MongoDBCounter(
+                uri=MONGODB_URI,
+                database=MONGODB_DATABASE,
+                collection=MONGODB_COLLECTION
+            )
+            if mongo_counter.connect():
+                logger.info("MongoDB counter initialized successfully")
+            else:
+                logger.warning("MongoDB counter failed to initialize")
+                mongo_counter = None
+        except Exception as e:
+            logger.error("Error initializing MongoDB counter: %s", e)
+            mongo_counter = None
+    else:
+        logger.warning("MONGODB_URI not found. Running without persistent counter.")
+        mongo_counter = None
+
+    # Initialize retriever
     if not HF_TOKEN:
         logger.warning("HF_TOKEN not found. Starting API without retriever.")
-        query_count = load_query_counter_from_file()
         yield
+        if mongo_counter:
+            mongo_counter.close()
         return
 
     try:
@@ -578,23 +653,25 @@ async def lifespan(app: FastAPI):
             raise ValueError(f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
 
         retriever = HybridRetriever(chunks, embeddings, hf_client)
-        query_count = load_query_counter_from_file()
-        logger.info("Startup complete. query_count=%s", query_count)
+        logger.info("Startup complete. MongoDB connected: %s", mongo_counter is not None and mongo_counter.is_connected())
         print("API ready")
     except Exception as e:
         logger.exception("Error during startup; continuing without retriever")
         print(f"Error during startup (degraded mode): {e}")
         retriever = None
         hf_client = None
-        query_count = load_query_counter_from_file()
 
     yield
+
+    # Cleanup
+    if mongo_counter:
+        mongo_counter.close()
 
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Optimized for proper chunking with all laws",
-    version="2.3.0",
+    description="Optimized for proper chunking with all laws - MongoDB persistent storage",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -611,7 +688,8 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.3.0",
+        "version": "2.4.0",
+        "storage": "MongoDB Atlas",
         "endpoints": {
             "/ask": "POST - Ask a question",
             "/health": "GET - Health check",
@@ -628,6 +706,7 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         retriever_loaded=True,
+        mongodb_connected=mongo_counter is not None and mongo_counter.is_connected(),
         model=GEMINI_MODEL,
         embedding_model=EMBED_MODEL_NAME,
         embedding_service="HuggingFace Inference API",
@@ -643,6 +722,10 @@ async def get_stats():
     unique_laws = sorted(list(set(c.get("law_number") for c in retriever.chunks if c.get("law_number"))))
     intro_count = sum(1 for c in retriever.chunks if c.get("subsection_number") == 0)
 
+    query_count = 0
+    if mongo_counter and mongo_counter.is_connected():
+        query_count = mongo_counter.get_count()
+
     return StatsResponse(
         total_chunks=len(retriever.chunks),
         embedding_dimension=retriever.embeddings.shape[1],
@@ -653,14 +736,13 @@ async def get_stats():
         max_total_context_chars=MAX_TOTAL_CONTEXT_CHARS,
         unique_laws=unique_laws,
         total_queries_processed=query_count,
-        intro_chunks_count=intro_count
+        intro_chunks_count=intro_count,
+        mongodb_connected=mongo_counter is not None and mongo_counter.is_connected()
     )
 
 
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
-    global query_count
-
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialised")
 
@@ -694,16 +776,27 @@ async def ask_question(request: QuestionRequest):
         }
 
         processing_time = (time.time() - start) * 1000
-        latest_count, counter_persisted = increment_and_persist_query_counter()
-        retrieval_info["query_counter"] = {
-            "value": latest_count,
-            "persisted": counter_persisted,
-        }
+
+        # Increment counter in MongoDB
+        if mongo_counter and mongo_counter.is_connected():
+            latest_count, counter_persisted = mongo_counter.increment()
+            retrieval_info["query_counter"] = {
+                "value": latest_count,
+                "persisted": counter_persisted,
+                "storage": "mongodb"
+            }
+        else:
+            retrieval_info["query_counter"] = {
+                "value": 0,
+                "persisted": False,
+                "storage": "none",
+                "error": "MongoDB not connected"
+            }
 
         logger.info(
             "Completed /ask request. processing_time_ms=%.2f counter=%s",
             processing_time,
-            latest_count,
+            retrieval_info["query_counter"]["value"]
         )
 
         return QuestionResponse(
@@ -717,3 +810,8 @@ async def ask_question(request: QuestionRequest):
     except Exception as e:
         logger.exception("Error while processing /ask request")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
