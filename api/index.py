@@ -1,6 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.4.3 - Clear English answers with simple citations
+Version 2.4.4 - Clear English answers with structured evidence section
 """
 import os
 import json
@@ -581,21 +581,24 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "- How play restarts\n"
         "- Any disciplinary action (if applicable)\n"
         "- Why this is the correct ruling\n\n"
-        "Write this as natural paragraphs - DO NOT use bullet points, numbered lists, or section headers like "
-        "\"Answer:\", \"Decision:\", \"Restart:\", etc. Just write the answer naturally.\n\n"
-        "After your explanation, add the citations. List them simply without any header or title:\n\n"
-        "[Law X – Title, Subsection (pdf pages Y–Z)]\n"
-        "\"Quote from the law\"\n\n"
-        "[Law X – Title, Subsection (pdf pages Y–Z)]\n"
-        "\"Quote from the law\"\n\n"
+        "Write this as natural paragraphs - DO NOT use bullet points, numbered lists, or section headers "
+        "in the main explanation. Just write the answer naturally in flowing prose.\n\n"
+        "After your explanation, add a structured evidence section:\n\n"
+        "**Supporting Evidence:**\n\n"
+        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
+        "\"Quote from the law that supports the answer\"\n\n"
+        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
+        "\"Quote from the law that supports the answer\"\n\n"
         "RULES:\n"
         "- NO greetings, NO pleasantries - start directly with the answer\n"
-        "- Write in clear, natural English - like explaining to a friend\n"
-        "- NO structured breakdowns with headers like \"Decision:\", \"Restart:\", \"Discipline:\"\n"
-        "- NO bullet points or numbered lists in the main answer\n"
-        "- Just write flowing paragraphs that explain what happens\n"
-        "- End with simple citations (no header like \"References:\" or \"Supporting Law References:\")\n"
-        "- Each citation should be: [Full citation] followed by \"quote\"\n"
+        "- Main answer: Write in clear, natural English prose - like explaining to a friend\n"
+        "- Main answer: NO structured breakdowns with headers like \"Decision:\", \"Restart:\", \"Discipline:\"\n"
+        "- Main answer: NO bullet points or numbered lists\n"
+        "- Main answer: Just write flowing paragraphs that explain what happens\n"
+        "- Evidence section: USE the structured format with \"**Supporting Evidence:**\" header\n"
+        "- Evidence section: Each law citation should be bolded with **Law X – Title, Subsection**\n"
+        "- Evidence section: Include page numbers in parentheses\n"
+        "- Evidence section: Quote the relevant text that supports your answer\n"
         "- Do not invent Laws, restarts, or cards\n"
         "- Do not use outside knowledge\n"
         "- Every claim must be supported by the extracts\n"
@@ -689,8 +692,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Clear English answers with simple citations - MongoDB persistent storage",
-    version="2.4.3",
+    description="Clear English answers with structured evidence section - MongoDB persistent storage",
+    version="2.4.4",
     lifespan=lifespan,
 )
 
@@ -707,8 +710,8 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.4.3",
-        "improvements": "Clear English answers with simple citations",
+        "version": "2.4.4",
+        "improvements": "Clear English answers with structured evidence",
         "storage": "MongoDB Atlas",
         "endpoints": {
             "/ask": "POST - Ask a question",
