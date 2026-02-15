@@ -1,7 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.4 - MongoDB Integration for Persistent Query Counter
-IMPROVED: Better handling of unanswerable questions
+Version 2.4.3 - Clear English answers with simple citations
 """
 import os
 import json
@@ -575,26 +574,31 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "• The question may require interpretation beyond what's explicitly written\n"
         "• The relevant section might not have been retrieved in my search\n\n"
         "You can rephrase your question or ask about a related topic.\"\n\n"
-        "For answerable questions, follow this structure exactly:\n\n"
-        "1) Answer (Direct response to the question)\n"
-        "   - Decision: [What should happen - be specific to the scenario]\n"
-        "   - Restart: [Specify the exact restart based on the situation]\n"
-        "   - Discipline: [If applicable, otherwise state 'None']\n"
-        "   - Explanation: [Brief plain English explanation applied to the specific scenario]\n\n"
-        "2) Supporting Law References\n"
-        "   - Relevant Law & subsection: [Law number + subsection title]\n"
-        "   - Evidence: [Provide 1–2 short quotes]\n"
-        "   - Citation: [Include the exact CITATION line after each quote]\n\n"
-        "Rules:\n"
+        "ANSWER FORMAT:\n"
+        "Write your answer in clear, flowing English prose. Explain what happens in the scenario naturally, "
+        "as if speaking to someone. Include all relevant details about:\n"
+        "- What the decision should be\n"
+        "- How play restarts\n"
+        "- Any disciplinary action (if applicable)\n"
+        "- Why this is the correct ruling\n\n"
+        "Write this as natural paragraphs - DO NOT use bullet points, numbered lists, or section headers like "
+        "\"Answer:\", \"Decision:\", \"Restart:\", etc. Just write the answer naturally.\n\n"
+        "After your explanation, add the citations. List them simply without any header or title:\n\n"
+        "[Law X – Title, Subsection (pdf pages Y–Z)]\n"
+        "\"Quote from the law\"\n\n"
+        "[Law X – Title, Subsection (pdf pages Y–Z)]\n"
+        "\"Quote from the law\"\n\n"
+        "RULES:\n"
         "- NO greetings, NO pleasantries - start directly with the answer\n"
-        "- Be helpful but concise - maintain professional tone without being chatty\n"
-        "- If you cannot find clear support in the extracts, use the unanswerable format\n"
-        "- Lead with the ANSWER - what actually happens in this scenario\n"
-        "- Then provide the legal basis and evidence\n"
+        "- Write in clear, natural English - like explaining to a friend\n"
+        "- NO structured breakdowns with headers like \"Decision:\", \"Restart:\", \"Discipline:\"\n"
+        "- NO bullet points or numbered lists in the main answer\n"
+        "- Just write flowing paragraphs that explain what happens\n"
+        "- End with simple citations (no header like \"References:\" or \"Supporting Law References:\")\n"
+        "- Each citation should be: [Full citation] followed by \"quote\"\n"
         "- Do not invent Laws, restarts, or cards\n"
         "- Do not use outside knowledge\n"
-        "- Every Decision/Restart/Discipline claim must be supported by the Evidence quotes\n"
-        "- Pay special attention to Introduction sections which often contain key rules\n"
+        "- Every claim must be supported by the extracts\n"
     )
 
     user_prompt = (
@@ -685,8 +689,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Optimized for proper chunking with all laws - MongoDB persistent storage - No greetings",
-    version="2.4.2",
+    description="Clear English answers with simple citations - MongoDB persistent storage",
+    version="2.4.3",
     lifespan=lifespan,
 )
 
@@ -703,8 +707,8 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.4.2",
-        "improvements": "Direct answers - no greetings in responses",
+        "version": "2.4.3",
+        "improvements": "Clear English answers with simple citations",
         "storage": "MongoDB Atlas",
         "endpoints": {
             "/ask": "POST - Ask a question",
