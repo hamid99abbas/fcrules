@@ -68,7 +68,6 @@ logging.basicConfig(
 logger = logging.getLogger("fcrules.api")
 counter_lock = threading.Lock()
 
-
 # -----------------------------
 # SESSION MANAGER
 # -----------------------------
@@ -197,7 +196,6 @@ class SessionManager:
 
         if expired:
             logger.info("Cleaned up %d expired sessions", len(expired))
-
 
 # -----------------------------
 # MONGODB CLIENT
@@ -328,7 +326,6 @@ class MongoDBCounter:
                 logger.error("Error closing MongoDB connection: %s", e)
             finally:
                 self._connected = False
-
 
 # -----------------------------
 # PYDANTIC MODELS
@@ -495,8 +492,7 @@ def expand_query_with_synonyms(query: str) -> str:
         # Core mappings
         "referee": ["match official", "touches a match official", "ball out of play", "dropped ball", "law 9"],
         "match official": ["referee", "touches a match official", "ball out of play", "dropped ball", "law 9"],
-        "ball hits referee": ["touches a match official", "law 9", "ball out of play", "dropped ball",
-                              "promising attack"],
+        "ball hits referee": ["touches a match official", "law 9", "ball out of play", "dropped ball", "promising attack"],
 
         # Goal scoring mappings
         "throw-in": ["throw in", "Law 15", "awarded", "introduction"],
@@ -789,8 +785,7 @@ def build_context(chunks: List[Dict[str, Any]], conversation_history: List[Dict]
     return "\n\n".join(parts)
 
 
-def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dict[str, Any] = None,
-                  conversation_history: List[Dict] = None) -> str:
+def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dict[str, Any] = None, conversation_history: List[Dict] = None) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY.")
 
@@ -816,8 +811,7 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
 
     # Add follow-up context
     if context_info and context_info.get("is_follow_up"):
-        scenario_hints.append(
-            f"This is a follow-up question related to: {context_info.get('conversation_topic', 'previous discussion')}")
+        scenario_hints.append(f"This is a follow-up question related to: {context_info.get('conversation_topic', 'previous discussion')}")
 
     scenario_text = "\n".join(scenario_hints) if scenario_hints else "General scenario."
 
@@ -950,8 +944,7 @@ async def lifespan(app: FastAPI):
             raise ValueError(f"Mismatch: {len(chunks)} chunks but {len(embeddings)} embeddings")
 
         retriever = HybridRetriever(chunks, embeddings, hf_client)
-        logger.info("Startup complete. MongoDB connected: %s",
-                    mongo_counter is not None and mongo_counter.is_connected())
+        logger.info("Startup complete. MongoDB connected: %s", mongo_counter is not None and mongo_counter.is_connected())
         print("API ready")
     except Exception as e:
         logger.exception("Error during startup; continuing without retriever")
@@ -1075,8 +1068,8 @@ async def get_stats():
 
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(
-        request: QuestionRequest,
-        x_session_id: Optional[str] = Header(None, alias="X-Session-ID")
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID")
 ):
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialised")
@@ -1125,8 +1118,7 @@ async def ask_question(
         # Build evidence list
         evidence_list = []
         for i, chunk in enumerate(top_chunks, 1):
-            text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get(
-                "text", "")
+            text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get("text", "")
             evidence_list.append(
                 Evidence(
                     rank=i,
@@ -1213,5 +1205,4 @@ async def ask_question(
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
