@@ -1,6 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.4.4 - Clear English answers with structured evidence section
+Version 2.4.5 - Fixed citation formatting to prevent badge rendering issues
 """
 import os
 import json
@@ -312,17 +312,19 @@ def format_citation(c: Dict[str, Any]) -> str:
     pages = f"pdf pages {c.get('page_start')}–{c.get('page_end')}"
     sub_num = c.get('subsection_number', 0)
     sub_title = c.get('subsection_title', 'Unknown')
+    law_num = c.get('law_number')
+    law_title = c.get('law_title')
 
     # Handle subsection 0 (Introduction) specially
     if sub_num == 0:
         return (
-            f"Law {c.get('law_number')} – {c.get('law_title')}, "
+            f"Rule {law_num} ({law_title}), "
             f"Introduction ({pages})"
         )
     else:
         return (
-            f"Law {c.get('law_number')} – {c.get('law_title')}, "
-            f"{sub_num}. {sub_title} "
+            f"Rule {law_num} ({law_title}), "
+            f"Section {sub_num}: {sub_title} "
             f"({pages})"
         )
 
@@ -585,10 +587,17 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "in the main explanation. Just write the answer naturally in flowing prose.\n\n"
         "After your explanation, add a structured evidence section:\n\n"
         "**Supporting Evidence:**\n\n"
-        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
+        "**Reference [1]:** Rule X (Title), Section Y: Description (pdf pages A–B)\n"
         "\"Quote from the law that supports the answer\"\n\n"
-        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
+        "**Reference [2]:** Rule X (Title), Section Y: Description (pdf pages A–B)\n"
         "\"Quote from the law that supports the answer\"\n\n"
+        "CRITICAL CITATION FORMATTING RULES:\n"
+        "- NEVER write 'Law 9' or 'LAW 9' directly\n"
+        "- ALWAYS use 'Rule [number]' format to prevent badge rendering\n"
+        "- Example: 'Rule 9' NOT 'Law 9'\n"
+        "- Example: 'Rule 12' NOT 'Law 12'\n"
+        "- Use numbered references like [1], [2], [3] for each citation\n"
+        "- Keep law numbers as part of 'Rule X' format, never standalone\n\n"
         "RULES:\n"
         "- NO greetings, NO pleasantries - start directly with the answer\n"
         "- Main answer: Write in clear, natural English prose - like explaining to a friend\n"
@@ -596,7 +605,7 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
         "- Main answer: NO bullet points or numbered lists\n"
         "- Main answer: Just write flowing paragraphs that explain what happens\n"
         "- Evidence section: USE the structured format with \"**Supporting Evidence:**\" header\n"
-        "- Evidence section: Each law citation should be bolded with **Law X – Title, Subsection**\n"
+        "- Evidence section: Format citations as **Reference [N]:** Rule X (Title), Section Y\n"
         "- Evidence section: Include page numbers in parentheses\n"
         "- Evidence section: Quote the relevant text that supports your answer\n"
         "- Do not invent Laws, restarts, or cards\n"
@@ -692,8 +701,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Clear English answers with structured evidence section - MongoDB persistent storage",
-    version="2.4.4",
+    description="Clear English answers with structured evidence section - Fixed citation formatting",
+    version="2.4.5",
     lifespan=lifespan,
 )
 
@@ -710,8 +719,8 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.4.4",
-        "improvements": "Clear English answers with structured evidence",
+        "version": "2.4.5",
+        "improvements": "Fixed citation formatting to prevent badge rendering",
         "storage": "MongoDB Atlas",
         "endpoints": {
             "/ask": "POST - Ask a question",
