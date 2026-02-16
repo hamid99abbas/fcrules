@@ -1,17 +1,15 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.5.0 - Session-level context awareness for follow-up questions
+Version 2.4.5 - Fixed citation formatting to prevent badge rendering issues
 """
 import os
 import json
 import re
 import logging
 import threading
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
 
 import numpy as np
 import faiss
@@ -20,7 +18,7 @@ from huggingface_hub import InferenceClient
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, OperationFailure
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import time
@@ -40,15 +38,10 @@ TOP_K = 10
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
-# session management
-SESSION_TIMEOUT_MINUTES = 30
-MAX_CONVERSATION_HISTORY = 5  # Keep last 5 Q&A pairs
-
 # MongoDB configuration
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "fcrules")
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "query_stats")
-MONGODB_SESSIONS_COLLECTION = os.getenv("MONGODB_SESSIONS_COLLECTION", "sessions")
 
 # API keys from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -67,135 +60,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fcrules.api")
 counter_lock = threading.Lock()
-
-# -----------------------------
-# SESSION MANAGER
-# -----------------------------
-class SessionManager:
-    """Manages conversation sessions in-memory with MongoDB persistence option"""
-
-    def __init__(self, mongo_db=None):
-        self.sessions: Dict[str, Dict[str, Any]] = {}
-        self.mongo_db = mongo_db
-        self.sessions_collection = None
-
-        if mongo_db:
-            self.sessions_collection = mongo_db[MONGODB_SESSIONS_COLLECTION]
-            # Create TTL index to auto-delete old sessions
-            try:
-                self.sessions_collection.create_index(
-                    "last_activity",
-                    expireAfterSeconds=SESSION_TIMEOUT_MINUTES * 60
-                )
-                logger.info("Session TTL index created")
-            except Exception as e:
-                logger.warning("Could not create TTL index: %s", e)
-
-    def create_session(self) -> str:
-        """Create a new session and return session ID"""
-        session_id = str(uuid.uuid4())
-        session_data = {
-            "session_id": session_id,
-            "created_at": datetime.utcnow(),
-            "last_activity": datetime.utcnow(),
-            "conversation_history": []
-        }
-
-        self.sessions[session_id] = session_data
-
-        # Persist to MongoDB if available
-        if self.sessions_collection:
-            try:
-                self.sessions_collection.insert_one(session_data.copy())
-            except Exception as e:
-                logger.warning("Could not persist session to MongoDB: %s", e)
-
-        return session_id
-
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session data by ID"""
-        # Try memory first
-        if session_id in self.sessions:
-            session = self.sessions[session_id]
-            # Check if expired
-            if datetime.utcnow() - session["last_activity"] > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
-                self.delete_session(session_id)
-                return None
-            return session
-
-        # Try MongoDB
-        if self.sessions_collection:
-            try:
-                session = self.sessions_collection.find_one({"session_id": session_id})
-                if session:
-                    # Load into memory
-                    self.sessions[session_id] = session
-                    return session
-            except Exception as e:
-                logger.warning("Could not load session from MongoDB: %s", e)
-
-        return None
-
-    def update_session(self, session_id: str, question: str, answer: str, evidence: List[Dict]):
-        """Add a Q&A pair to session history"""
-        session = self.get_session(session_id)
-        if not session:
-            return
-
-        session["last_activity"] = datetime.utcnow()
-
-        # Add to history
-        qa_pair = {
-            "timestamp": datetime.utcnow(),
-            "question": question,
-            "answer": answer,
-            "evidence_laws": list(set([e.get("law_number") for e in evidence if e.get("law_number")]))
-        }
-
-        session["conversation_history"].append(qa_pair)
-
-        # Keep only last N pairs
-        if len(session["conversation_history"]) > MAX_CONVERSATION_HISTORY:
-            session["conversation_history"] = session["conversation_history"][-MAX_CONVERSATION_HISTORY:]
-
-        # Update MongoDB
-        if self.sessions_collection:
-            try:
-                self.sessions_collection.update_one(
-                    {"session_id": session_id},
-                    {
-                        "$set": {
-                            "last_activity": session["last_activity"],
-                            "conversation_history": session["conversation_history"]
-                        }
-                    }
-                )
-            except Exception as e:
-                logger.warning("Could not update session in MongoDB: %s", e)
-
-    def delete_session(self, session_id: str):
-        """Delete a session"""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-
-        if self.sessions_collection:
-            try:
-                self.sessions_collection.delete_one({"session_id": session_id})
-            except Exception as e:
-                logger.warning("Could not delete session from MongoDB: %s", e)
-
-    def cleanup_expired_sessions(self):
-        """Remove expired sessions from memory"""
-        cutoff = datetime.utcnow() - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-        expired = [
-            sid for sid, session in self.sessions.items()
-            if session["last_activity"] < cutoff
-        ]
-        for sid in expired:
-            del self.sessions[sid]
-
-        if expired:
-            logger.info("Cleaned up %d expired sessions", len(expired))
 
 # -----------------------------
 # MONGODB CLIENT
@@ -341,14 +205,6 @@ class Evidence(BaseModel):
     citation: str
     text_preview: str
     full_text: Optional[str] = None
-    law_number: Optional[int] = None
-
-
-class ConversationContext(BaseModel):
-    timestamp: str
-    question: str
-    answer_preview: str
-    laws_referenced: List[int]
 
 
 class QuestionResponse(BaseModel):
@@ -357,21 +213,12 @@ class QuestionResponse(BaseModel):
     evidence: List[Evidence]
     retrieval_info: Dict[str, Any]
     processing_time_ms: Optional[float] = None
-    session_id: str
-    conversation_context: Optional[List[ConversationContext]] = None
-
-
-class SessionResponse(BaseModel):
-    session_id: str
-    created_at: str
-    conversation_history: List[Dict[str, Any]]
 
 
 class HealthResponse(BaseModel):
     status: str
     retriever_loaded: bool
     mongodb_connected: bool
-    session_manager_enabled: bool
     model: str
     embedding_model: str
     embedding_service: str
@@ -390,7 +237,6 @@ class StatsResponse(BaseModel):
     total_queries_processed: int
     intro_chunks_count: int
     mongodb_connected: bool
-    active_sessions: int
 
 
 # -----------------------------
@@ -462,7 +308,7 @@ def load_embeddings(path: Path) -> np.ndarray:
 
 
 def format_citation(c: Dict[str, Any]) -> str:
-    """Format citation with proper spacing to prevent badge concatenation"""
+    """Format citation with proper handling of subsection 0 (Introduction)"""
     pages = f"pdf pages {c.get('page_start')}–{c.get('page_end')}"
     sub_num = c.get('subsection_number', 0)
     sub_title = c.get('subsection_title', 'Unknown')
@@ -472,12 +318,12 @@ def format_citation(c: Dict[str, Any]) -> str:
     # Handle subsection 0 (Introduction) specially
     if sub_num == 0:
         return (
-            f"Law {law_num} – {law_title}, "
+            f"Rule {law_num} ({law_title}), "
             f"Introduction ({pages})"
         )
     else:
         return (
-            f"Law {law_num} – {law_title}, "
+            f"Rule {law_num} ({law_title}), "
             f"Section {sub_num}: {sub_title} "
             f"({pages})"
         )
@@ -530,65 +376,6 @@ def extract_scenario_context(query: str) -> Dict[str, Any]:
     return context
 
 
-def detect_follow_up_question(question: str, conversation_history: List[Dict]) -> Dict[str, Any]:
-    """Detect if this is a follow-up question and extract context"""
-    if not conversation_history:
-        return {"is_follow_up": False}
-
-    q_lower = question.lower()
-
-    # Follow-up indicators
-    follow_up_patterns = [
-        r'\b(what about|how about|and if|but what if|what if instead)\b',
-        r'\b(also|additionally|furthermore|moreover)\b',
-        r'\b(that|this|these|those|it|they)\b',
-        r'^(and |but |so |then |however |although )',
-        r'\?$'  # Questions ending with ?
-    ]
-
-    is_follow_up = any(re.search(pattern, q_lower) for pattern in follow_up_patterns)
-
-    # Extract referenced laws from recent history
-    recent_laws = set()
-    for qa in conversation_history[-2:]:  # Last 2 Q&A pairs
-        recent_laws.update(qa.get("evidence_laws", []))
-
-    return {
-        "is_follow_up": is_follow_up,
-        "referenced_laws": list(recent_laws),
-        "previous_question": conversation_history[-1]["question"] if conversation_history else None,
-        "conversation_topic": extract_topic(conversation_history)
-    }
-
-
-def extract_topic(conversation_history: List[Dict]) -> Optional[str]:
-    """Extract the main topic from conversation history"""
-    if not conversation_history:
-        return None
-
-    # Simple topic extraction from most recent questions
-    recent_questions = [qa["question"] for qa in conversation_history[-2:]]
-    combined = " ".join(recent_questions).lower()
-
-    topics = {
-        "handball": ["handball", "hand", "arm"],
-        "offside": ["offside"],
-        "penalty": ["penalty"],
-        "referee": ["referee", "match official"],
-        "goalkeeper": ["goalkeeper", "keeper", "goalie"],
-        "goal kick": ["goal kick"],
-        "throw-in": ["throw-in", "throw in"],
-        "corner": ["corner"],
-        "substitution": ["substitute", "substitution"]
-    }
-
-    for topic, keywords in topics.items():
-        if any(kw in combined for kw in keywords):
-            return topic
-
-    return None
-
-
 # -----------------------------
 # RETRIEVER
 # -----------------------------
@@ -608,14 +395,10 @@ class HybridRetriever:
 
         print(f"Retriever initialized with {len(chunks)} chunks")
 
-    def route_rules(self, query: str, context_laws: List[int] = None) -> Dict[str, Any]:
+    def route_rules(self, query: str) -> Dict[str, Any]:
         q = query.lower()
         law_boost = set()
         subsection_terms = []
-
-        # Add laws from conversation context
-        if context_laws:
-            law_boost.update(context_laws)
 
         # Ball hits referee
         if any(k in q for k in ["referee", "match official", "ball hits"]):
@@ -664,29 +447,8 @@ class HybridRetriever:
 
         return {"law_boost": law_boost, "subsection_terms": subsection_terms}
 
-    def search(self, query: str, top_k: int = 10, context_info: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        # Enhance query with context if it's a follow-up
-        enhanced_query = query
-        context_laws = []
-
-        if context_info and context_info.get("is_follow_up"):
-            context_laws = context_info.get("referenced_laws", [])
-            prev_question = context_info.get("previous_question")
-            topic = context_info.get("conversation_topic")
-
-            # Add context to query
-            context_parts = []
-            if topic:
-                context_parts.append(topic)
-            if prev_question:
-                # Take key terms from previous question
-                key_terms = [w for w in prev_question.split() if len(w) > 4][:3]
-                context_parts.extend(key_terms)
-
-            if context_parts:
-                enhanced_query = query + " " + " ".join(context_parts)
-
-        expanded_query = expand_query_with_synonyms(enhanced_query)
+    def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        expanded_query = expand_query_with_synonyms(query)
         q_tokens = tokenize(expanded_query)
         bm25_scores = self.bm25.get_scores(q_tokens)
         bm25_top = np.argsort(bm25_scores)[::-1][: max(80, top_k * 10)]
@@ -697,7 +459,7 @@ class HybridRetriever:
         sim_ids = sim_ids[0].tolist()
 
         cand_ids = list(dict.fromkeys(list(bm25_top) + sim_ids))
-        routing = self.route_rules(query, context_laws=context_laws)
+        routing = self.route_rules(query)
         law_boost = routing["law_boost"]
         subsection_terms = routing["subsection_terms"]
 
@@ -753,21 +515,9 @@ class HybridRetriever:
 # -----------------------------
 # GEMINI ANSWER
 # -----------------------------
-def build_context(chunks: List[Dict[str, Any]], conversation_history: List[Dict] = None) -> str:
+def build_context(chunks: List[Dict[str, Any]]) -> str:
     parts = []
-
-    # Add conversation context if available
-    if conversation_history and len(conversation_history) > 0:
-        parts.append("[CONVERSATION CONTEXT]")
-        for i, qa in enumerate(conversation_history[-2:], 1):  # Last 2 Q&A
-            parts.append(f"Previous Q{i}: {qa['question']}")
-            # Add short answer preview
-            answer_preview = qa['answer'][:200] + "..." if len(qa['answer']) > 200 else qa['answer']
-            parts.append(f"Previous A{i}: {answer_preview}")
-        parts.append("\n[CURRENT QUESTION EXTRACTS]\n")
-
-    total = sum(len(p) for p in parts)
-
+    total = 0
     for idx, c in enumerate(chunks, 1):
         text = (c.get("text") or "").strip()
         if len(text) > MAX_CHARS_PER_CHUNK:
@@ -781,11 +531,10 @@ def build_context(chunks: List[Dict[str, Any]], conversation_history: List[Dict]
             break
         parts.append(block)
         total += len(block)
-
     return "\n\n".join(parts)
 
 
-def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dict[str, Any] = None, conversation_history: List[Dict] = None) -> str:
+def gemini_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY.")
 
@@ -797,7 +546,7 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     scenario = extract_scenario_context(question)
-    context = build_context(chunks, conversation_history)
+    context = build_context(chunks)
 
     scenario_hints = []
     if scenario["involves_referee"]:
@@ -809,20 +558,11 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
     if scenario["can_score"]:
         scenario_hints.append("This is asking whether a goal can be scored in this situation.")
 
-    # Add follow-up context
-    if context_info and context_info.get("is_follow_up"):
-        scenario_hints.append(f"This is a follow-up question related to: {context_info.get('conversation_topic', 'previous discussion')}")
-
     scenario_text = "\n".join(scenario_hints) if scenario_hints else "General scenario."
 
     system_instruction = (
         "You are a Laws of the Game (football/soccer) assistant.\n"
         "You MUST answer using ONLY the provided EXTRACTS.\n\n"
-        "CONVERSATION AWARENESS:\n"
-        "- If CONVERSATION CONTEXT is provided, you can reference previous questions/answers\n"
-        "- Use phrases like 'As mentioned before', 'Following up on that', 'In addition to the previous answer'\n"
-        "- Connect current answer to previous context naturally\n"
-        "- If the user says 'that', 'it', 'this situation', refer to the previous context\n\n"
         "IMPORTANT - NO GREETINGS OR PLEASANTRIES:\n"
         "- Do NOT include greetings like 'Hello', 'Hi', 'Great question', etc.\n"
         "- Do NOT include closing pleasantries like 'Hope this helps', 'Let me know if...', etc.\n"
@@ -847,10 +587,17 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
         "in the main explanation. Just write the answer naturally in flowing prose.\n\n"
         "After your explanation, add a structured evidence section:\n\n"
         "**Supporting Evidence:**\n\n"
-        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
+        "**Reference [1]:** Rule X (Title), Section Y: Description (pdf pages A–B)\n"
         "\"Quote from the law that supports the answer\"\n\n"
-        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
+        "**Reference [2]:** Rule X (Title), Section Y: Description (pdf pages A–B)\n"
         "\"Quote from the law that supports the answer\"\n\n"
+        "CRITICAL CITATION FORMATTING RULES:\n"
+        "- NEVER write 'Law 9' or 'LAW 9' directly\n"
+        "- ALWAYS use 'Rule [number]' format to prevent badge rendering\n"
+        "- Example: 'Rule 9' NOT 'Law 9'\n"
+        "- Example: 'Rule 12' NOT 'Law 12'\n"
+        "- Use numbered references like [1], [2], [3] for each citation\n"
+        "- Keep law numbers as part of 'Rule X' format, never standalone\n\n"
         "RULES:\n"
         "- NO greetings, NO pleasantries - start directly with the answer\n"
         "- Main answer: Write in clear, natural English prose - like explaining to a friend\n"
@@ -858,7 +605,7 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
         "- Main answer: NO bullet points or numbered lists\n"
         "- Main answer: Just write flowing paragraphs that explain what happens\n"
         "- Evidence section: USE the structured format with \"**Supporting Evidence:**\" header\n"
-        "- Evidence section: Each law citation should be bolded with **Law X – Title, Subsection**\n"
+        "- Evidence section: Format citations as **Reference [N]:** Rule X (Title), Section Y\n"
         "- Evidence section: Include page numbers in parentheses\n"
         "- Evidence section: Quote the relevant text that supports your answer\n"
         "- Do not invent Laws, restarts, or cards\n"
@@ -889,16 +636,14 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
 retriever: Optional[HybridRetriever] = None
 hf_client: Optional[HFEmbeddingClient] = None
 mongo_counter: Optional[MongoDBCounter] = None
-session_manager: Optional[SessionManager] = None
 start_time = time.time()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global retriever, hf_client, mongo_counter, session_manager
+    global retriever, hf_client, mongo_counter
 
     # Initialize MongoDB counter
-    mongo_db = None
     if MONGODB_URI:
         try:
             mongo_counter = MongoDBCounter(
@@ -908,7 +653,6 @@ async def lifespan(app: FastAPI):
             )
             if mongo_counter.connect():
                 logger.info("MongoDB counter initialized successfully")
-                mongo_db = mongo_counter.db
             else:
                 logger.warning("MongoDB counter failed to initialize")
                 mongo_counter = None
@@ -918,10 +662,6 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("MONGODB_URI not found. Running without persistent counter.")
         mongo_counter = None
-
-    # Initialize session manager
-    session_manager = SessionManager(mongo_db=mongo_db)
-    logger.info("Session manager initialized")
 
     # Initialize retriever
     if not HF_TOKEN:
@@ -961,8 +701,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Session-aware RAG with context for follow-up questions",
-    version="2.5.0",
+    description="Clear English answers with structured evidence section - Fixed citation formatting",
+    version="2.4.5",
     lifespan=lifespan,
 )
 
@@ -979,44 +719,15 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.5.0",
-        "improvements": "Session-level context awareness for follow-up questions",
+        "version": "2.4.5",
+        "improvements": "Fixed citation formatting to prevent badge rendering",
         "storage": "MongoDB Atlas",
         "endpoints": {
-            "/ask": "POST - Ask a question (with optional X-Session-ID header)",
-            "/session/new": "POST - Create new session",
-            "/session/{session_id}": "GET - Get session history",
+            "/ask": "POST - Ask a question",
             "/health": "GET - Health check",
             "/stats": "GET - Statistics"
         }
     }
-
-
-@app.post("/session/new")
-async def create_new_session():
-    """Create a new conversation session"""
-    if not session_manager:
-        raise HTTPException(status_code=503, detail="Session manager not available")
-
-    session_id = session_manager.create_session()
-    return {"session_id": session_id, "message": "New session created"}
-
-
-@app.get("/session/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
-    """Get conversation history for a session"""
-    if not session_manager:
-        raise HTTPException(status_code=503, detail="Session manager not available")
-
-    session = session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
-
-    return SessionResponse(
-        session_id=session["session_id"],
-        created_at=session["created_at"].isoformat(),
-        conversation_history=session["conversation_history"]
-    )
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -1028,7 +739,6 @@ async def health_check():
         status="healthy",
         retriever_loaded=True,
         mongodb_connected=mongo_counter is not None and mongo_counter.is_connected(),
-        session_manager_enabled=session_manager is not None,
         model=GEMINI_MODEL,
         embedding_model=EMBED_MODEL_NAME,
         embedding_service="HuggingFace Inference API",
@@ -1048,8 +758,6 @@ async def get_stats():
     if mongo_counter and mongo_counter.is_connected():
         query_count = mongo_counter.get_count()
 
-    active_sessions = len(session_manager.sessions) if session_manager else 0
-
     return StatsResponse(
         total_chunks=len(retriever.chunks),
         embedding_dimension=retriever.embeddings.shape[1],
@@ -1061,61 +769,22 @@ async def get_stats():
         unique_laws=unique_laws,
         total_queries_processed=query_count,
         intro_chunks_count=intro_count,
-        mongodb_connected=mongo_counter is not None and mongo_counter.is_connected(),
-        active_sessions=active_sessions
+        mongodb_connected=mongo_counter is not None and mongo_counter.is_connected()
     )
 
 
 @app.post("/ask", response_model=QuestionResponse)
-async def ask_question(
-    request: QuestionRequest,
-    x_session_id: Optional[str] = Header(None, alias="X-Session-ID")
-):
+async def ask_question(request: QuestionRequest):
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialised")
 
     try:
-        logger.info("Received /ask request. question=%s, session_id=%s", request.question, x_session_id)
+        logger.info("Received /ask request. question=%s", request.question)
         start = time.time()
 
-        # Get or create session
-        session = None
-        if session_manager:
-            if x_session_id:
-                session = session_manager.get_session(x_session_id)
-                if not session:
-                    # Create new session if provided ID is invalid
-                    x_session_id = session_manager.create_session()
-                    session = session_manager.get_session(x_session_id)
-            else:
-                # No session ID provided, create new one
-                x_session_id = session_manager.create_session()
-                session = session_manager.get_session(x_session_id)
+        top_chunks = retriever.search(request.question, top_k=request.top_k)
+        answer = gemini_answer(request.question, top_chunks)
 
-        # Detect if this is a follow-up question
-        context_info = None
-        conversation_history = []
-        if session:
-            conversation_history = session.get("conversation_history", [])
-            context_info = detect_follow_up_question(request.question, conversation_history)
-            logger.info("Context detection: %s", context_info)
-
-        # Search with context awareness
-        top_chunks = retriever.search(
-            request.question,
-            top_k=request.top_k,
-            context_info=context_info
-        )
-
-        # Generate answer with conversation history
-        answer = gemini_answer(
-            request.question,
-            top_chunks,
-            context_info=context_info,
-            conversation_history=conversation_history
-        )
-
-        # Build evidence list
         evidence_list = []
         for i, chunk in enumerate(top_chunks, 1):
             text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get("text", "")
@@ -1124,18 +793,8 @@ async def ask_question(
                     rank=i,
                     citation=format_citation(chunk),
                     text_preview=text_preview,
-                    full_text=chunk.get("text", "") if request.include_raw_chunks else None,
-                    law_number=chunk.get("law_number")
+                    full_text=chunk.get("text", "") if request.include_raw_chunks else None
                 )
-            )
-
-        # Update session with this Q&A
-        if session_manager and x_session_id:
-            session_manager.update_session(
-                x_session_id,
-                request.question,
-                answer,
-                [{"law_number": e.law_number} for e in evidence_list]
             )
 
         routing = retriever.route_rules(request.question)
@@ -1145,9 +804,7 @@ async def ask_question(
             "expanded_query": expand_query_with_synonyms(request.question),
             "boosted_laws": list(routing["law_boost"]) if routing["law_boost"] else [],
             "scenario_context": scenario,
-            "chunks_retrieved": len(top_chunks),
-            "context_aware": context_info is not None,
-            "is_follow_up": context_info.get("is_follow_up", False) if context_info else False
+            "chunks_retrieved": len(top_chunks)
         }
 
         processing_time = (time.time() - start) * 1000
@@ -1168,24 +825,10 @@ async def ask_question(
                 "error": "MongoDB not connected"
             }
 
-        # Build conversation context for response
-        conversation_context_response = None
-        if conversation_history:
-            conversation_context_response = [
-                ConversationContext(
-                    timestamp=qa["timestamp"].isoformat(),
-                    question=qa["question"],
-                    answer_preview=qa["answer"][:150] + "..." if len(qa["answer"]) > 150 else qa["answer"],
-                    laws_referenced=qa.get("evidence_laws", [])
-                )
-                for qa in conversation_history[-3:]  # Last 3 Q&As
-            ]
-
         logger.info(
-            "Completed /ask request. processing_time_ms=%.2f counter=%s session=%s",
+            "Completed /ask request. processing_time_ms=%.2f counter=%s",
             processing_time,
-            retrieval_info["query_counter"]["value"],
-            x_session_id
+            retrieval_info["query_counter"]["value"]
         )
 
         return QuestionResponse(
@@ -1193,9 +836,7 @@ async def ask_question(
             answer=answer,
             evidence=evidence_list,
             retrieval_info=retrieval_info,
-            processing_time_ms=processing_time,
-            session_id=x_session_id or "none",
-            conversation_context=conversation_context_response
+            processing_time_ms=processing_time
         )
 
     except Exception as e:
