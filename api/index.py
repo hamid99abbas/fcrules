@@ -229,17 +229,35 @@ class SessionManager:
         return session_id
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session data by ID"""
+
+        def _normalize_datetimes(session: dict) -> dict:
+            """Ensure all datetime fields are timezone-aware (MongoDB returns naive datetimes)"""
+            for field in ("last_activity", "created_at"):
+                val = session.get(field)
+                if val and isinstance(val, datetime) and val.tzinfo is None:
+                    session[field] = val.replace(tzinfo=timezone.utc)
+            # Also fix datetimes nested inside conversation_history
+            for qa in session.get("conversation_history", []):
+                ts = qa.get("timestamp")
+                if ts and isinstance(ts, datetime) and ts.tzinfo is None:
+                    qa["timestamp"] = ts.replace(tzinfo=timezone.utc)
+            return session
+
+        # Try memory first
         if session_id in self.sessions:
-            session = self.sessions[session_id]
+            session = _normalize_datetimes(self.sessions[session_id])
             if datetime.now(timezone.utc) - session["last_activity"] > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
                 self.delete_session(session_id)
                 return None
             return session
 
+        # Try MongoDB
         if self.sessions_collection is not None:
             try:
                 session = self.sessions_collection.find_one({"session_id": session_id})
                 if session:
+                    session = _normalize_datetimes(session)
                     self.sessions[session_id] = session
                     return session
             except Exception as e:
