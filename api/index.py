@@ -1,6 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 2.5.0 - Session-level context awareness for follow-up questions
+Version 3.0.0 - Gemini Query Understanding + Hybrid RAG
 """
 import os
 import json
@@ -34,6 +34,7 @@ EMBEDDINGS_PATH = BASE_DIR / "rag_chunks" / "embeddings.npy"
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_FAST_MODEL = "gemini-2.0-flash"   # Used for query understanding (cheaper/faster)
 TOP_K = 10
 
 # context controls
@@ -42,7 +43,7 @@ MAX_TOTAL_CONTEXT_CHARS = 15000
 
 # session management
 SESSION_TIMEOUT_MINUTES = 30
-MAX_CONVERSATION_HISTORY = 5  # Keep last 5 Q&A pairs
+MAX_CONVERSATION_HISTORY = 5
 
 # MongoDB configuration
 MONGODB_URI = os.getenv("MONGODB_URI")
@@ -70,6 +71,124 @@ counter_lock = threading.Lock()
 
 
 # -----------------------------
+# GEMINI QUERY UNDERSTANDING  (NEW - Step 1)
+# -----------------------------
+def understand_query(question: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
+    """
+    Step 1: Use a fast Gemini model to interpret, disambiguate, and enrich
+    the user's question before hitting the retriever.
+
+    Returns a dict with:
+      - rewritten_query: technically precise version of the question
+      - likely_laws: list of law numbers most likely relevant
+      - key_concepts: list of key football-law terms to search
+      - interpretation_note: brief note on any ambiguity
+    """
+    if not GEMINI_API_KEY:
+        logger.warning("No GEMINI_API_KEY – skipping query understanding")
+        return {
+            "rewritten_query": question,
+            "likely_laws": [],
+            "key_concepts": [],
+            "interpretation_note": ""
+        }
+
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as e:
+        logger.error("Unable to import google-genai for query understanding: %s", e)
+        return {
+            "rewritten_query": question,
+            "likely_laws": [],
+            "key_concepts": [],
+            "interpretation_note": ""
+        }
+
+    # Build a short conversation context string if we have history
+    history_text = ""
+    if conversation_history:
+        recent = conversation_history[-2:]
+        lines = []
+        for qa in recent:
+            lines.append(f"Q: {qa['question']}")
+            lines.append(f"A (summary): {qa['answer'][:150]}...")
+        history_text = "\nRecent conversation:\n" + "\n".join(lines)
+
+    prompt = f"""You are a Football (Soccer) Laws of the Game expert assistant.
+
+A user asked: "{question}"{history_text}
+
+Your job is to interpret the question and prepare it for a legal text search of the Laws of the Game.
+
+Respond ONLY with a valid JSON object — no markdown, no explanation, no code fences:
+
+{{
+  "rewritten_query": "A technically precise version of the question using official Laws of the Game terminology. Expand abbreviations. Clarify ambiguous pronouns using conversation context if needed.",
+  "likely_laws": [list of integer law numbers most likely relevant — pick the best 1-4],
+  "key_concepts": ["list", "of", "precise", "football-law", "terms", "to", "search"],
+  "interpretation_note": "One sentence describing any ambiguity or assumption you made. Empty string if none."
+}}
+
+Reference guide for common Laws:
+- Law 1: Field of Play
+- Law 2: The Ball
+- Law 3: The Players (substitutions, team officials, extra persons)
+- Law 4: Players Equipment
+- Law 5: The Referee
+- Law 6: The Other Match Officials
+- Law 7: Duration of the Match
+- Law 8: The Start and Restart of Play (dropped ball, kick-off)
+- Law 9: Ball In and Out of Play
+- Law 10: Determining the Outcome (scoring a goal)
+- Law 11: Offside
+- Law 12: Fouls and Misconduct (fouls, free kicks, cards, handball, charges, tackles)
+- Law 13: Free Kicks
+- Law 14: The Penalty Kick
+- Law 15: The Throw-In
+- Law 16: The Goal Kick
+- Law 17: The Corner Kick
+
+Key terminology tips:
+- "shoulder charge" → "fair charge", "physical challenge", "Law 12", "playing distance", "ball within playing distance"
+- "ball hits referee" → "touches a match official", "Law 9", "dropped ball", "promising attack"
+- "handball" → "handling the ball", "deliberate handling", "Law 12"
+- "own goal" → "kicker's own goal", "thrower's own goal", "corner kick awarded", "Law 10"
+- "offside trap" → "offside position", "Law 11", "active play"
+- "time wasting" → "delaying restart", "Law 12", "cautionable offense"
+"""
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        resp = client.models.generate_content(
+            model=GEMINI_FAST_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+        text = (resp.text or "").strip()
+        # Strip any accidental markdown fences
+        text = re.sub(r"```json|```", "", text).strip()
+        result = json.loads(text)
+
+        # Validate and sanitise
+        return {
+            "rewritten_query": str(result.get("rewritten_query", question)),
+            "likely_laws": [int(x) for x in result.get("likely_laws", []) if str(x).isdigit()],
+            "key_concepts": [str(x) for x in result.get("key_concepts", [])],
+            "interpretation_note": str(result.get("interpretation_note", ""))
+        }
+
+    except Exception as e:
+        logger.warning("Query understanding failed (%s); falling back to raw query", e)
+        return {
+            "rewritten_query": question,
+            "likely_laws": [],
+            "key_concepts": [],
+            "interpretation_note": ""
+        }
+
+
+# -----------------------------
 # SESSION MANAGER
 # -----------------------------
 class SessionManager:
@@ -82,7 +201,6 @@ class SessionManager:
 
         if mongo_db is not None:
             self.sessions_collection = mongo_db[MONGODB_SESSIONS_COLLECTION]
-            # Create TTL index to auto-delete old sessions
             try:
                 self.sessions_collection.create_index(
                     "last_activity",
@@ -93,7 +211,6 @@ class SessionManager:
                 logger.warning("Could not create TTL index: %s", e)
 
     def create_session(self) -> str:
-        """Create a new session and return session ID"""
         session_id = str(uuid.uuid4())
         session_data = {
             "session_id": session_id,
@@ -101,10 +218,8 @@ class SessionManager:
             "last_activity": datetime.now(timezone.utc),
             "conversation_history": []
         }
-
         self.sessions[session_id] = session_data
 
-        # Persist to MongoDB if available
         if self.sessions_collection is not None:
             try:
                 self.sessions_collection.insert_one(session_data.copy())
@@ -114,22 +229,17 @@ class SessionManager:
         return session_id
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session data by ID"""
-        # Try memory first
         if session_id in self.sessions:
             session = self.sessions[session_id]
-            # Check if expired
             if datetime.now(timezone.utc) - session["last_activity"] > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
                 self.delete_session(session_id)
                 return None
             return session
 
-        # Try MongoDB
         if self.sessions_collection is not None:
             try:
                 session = self.sessions_collection.find_one({"session_id": session_id})
                 if session:
-                    # Load into memory
                     self.sessions[session_id] = session
                     return session
             except Exception as e:
@@ -138,28 +248,22 @@ class SessionManager:
         return None
 
     def update_session(self, session_id: str, question: str, answer: str, evidence: List[Dict]):
-        """Add a Q&A pair to session history"""
         session = self.get_session(session_id)
         if not session:
             return
 
         session["last_activity"] = datetime.now(timezone.utc)
-
-        # Add to history
         qa_pair = {
             "timestamp": datetime.now(timezone.utc),
             "question": question,
             "answer": answer,
             "evidence_laws": list(set([e.get("law_number") for e in evidence if e.get("law_number")]))
         }
-
         session["conversation_history"].append(qa_pair)
 
-        # Keep only last N pairs
         if len(session["conversation_history"]) > MAX_CONVERSATION_HISTORY:
             session["conversation_history"] = session["conversation_history"][-MAX_CONVERSATION_HISTORY:]
 
-        # Update MongoDB
         if self.sessions_collection is not None:
             try:
                 self.sessions_collection.update_one(
@@ -175,7 +279,6 @@ class SessionManager:
                 logger.warning("Could not update session in MongoDB: %s", e)
 
     def delete_session(self, session_id: str):
-        """Delete a session"""
         if session_id in self.sessions:
             del self.sessions[session_id]
 
@@ -186,7 +289,6 @@ class SessionManager:
                 logger.warning("Could not delete session from MongoDB: %s", e)
 
     def cleanup_expired_sessions(self):
-        """Remove expired sessions from memory"""
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
         expired = [
             sid for sid, session in self.sessions.items()
@@ -194,7 +296,6 @@ class SessionManager:
         ]
         for sid in expired:
             del self.sessions[sid]
-
         if expired:
             logger.info("Cleaned up %d expired sessions", len(expired))
 
@@ -203,8 +304,6 @@ class SessionManager:
 # MONGODB CLIENT
 # -----------------------------
 class MongoDBCounter:
-    """Thread-safe MongoDB-backed counter for query tracking"""
-
     def __init__(self, uri: str, database: str, collection: str):
         self.uri = uri
         self.database_name = database
@@ -215,7 +314,6 @@ class MongoDBCounter:
         self._connected = False
 
     def connect(self):
-        """Establish connection to MongoDB"""
         try:
             self.client = MongoClient(
                 self.uri,
@@ -223,14 +321,11 @@ class MongoDBCounter:
                 connectTimeoutMS=10000,
                 retryWrites=True
             )
-            # Test connection
             self.client.admin.command('ping')
-
             self.db = self.client[self.database_name]
             self.collection = self.db[self.collection_name]
             self._connected = True
 
-            # Initialize counter document if it doesn't exist
             result = self.collection.find_one({"_id": "query_counter"})
             if result is None:
                 self.collection.insert_one({
@@ -254,7 +349,6 @@ class MongoDBCounter:
             return False
 
     def is_connected(self) -> bool:
-        """Check if MongoDB connection is active"""
         if not self._connected or self.client is None:
             return False
         try:
@@ -265,13 +359,9 @@ class MongoDBCounter:
             return False
 
     def get_count(self) -> int:
-        """Get current query count from MongoDB"""
         if not self.is_connected():
-            logger.warning("MongoDB not connected. Attempting to reconnect...")
             if not self.connect():
-                logger.error("Failed to reconnect to MongoDB")
                 return 0
-
         try:
             result = self.collection.find_one({"_id": "query_counter"})
             if result:
@@ -282,16 +372,9 @@ class MongoDBCounter:
             return 0
 
     def increment(self) -> tuple[int, bool]:
-        """
-        Increment counter and return (new_count, success)
-        Thread-safe with MongoDB atomic operations
-        """
         if not self.is_connected():
-            logger.warning("MongoDB not connected. Attempting to reconnect...")
             if not self.connect():
-                logger.error("Failed to reconnect to MongoDB for increment")
                 return 0, False
-
         try:
             result = self.collection.find_one_and_update(
                 {"_id": "query_counter"},
@@ -302,15 +385,11 @@ class MongoDBCounter:
                 return_document=True,
                 upsert=True
             )
-
             if result:
                 new_count = int(result.get("count", 0))
                 logger.info("Query counter incremented to: %s", new_count)
                 return new_count, True
-            else:
-                logger.error("Failed to increment counter - no result returned")
-                return 0, False
-
+            return 0, False
         except OperationFailure as e:
             logger.error("MongoDB operation failed during increment: %s", e)
             return 0, False
@@ -319,7 +398,6 @@ class MongoDBCounter:
             return 0, False
 
     def close(self):
-        """Close MongoDB connection"""
         if self.client:
             try:
                 self.client.close()
@@ -354,6 +432,13 @@ class ConversationContext(BaseModel):
     laws_referenced: List[int]
 
 
+class QueryUnderstanding(BaseModel):
+    rewritten_query: str
+    likely_laws: List[int]
+    key_concepts: List[str]
+    interpretation_note: str
+
+
 class QuestionResponse(BaseModel):
     question: str
     answer: str
@@ -362,6 +447,7 @@ class QuestionResponse(BaseModel):
     processing_time_ms: Optional[float] = None
     session_id: str
     conversation_context: Optional[List[ConversationContext]] = None
+    query_understanding: Optional[QueryUnderstanding] = None  # NEW – visible in response
 
 
 class SessionResponse(BaseModel):
@@ -376,6 +462,7 @@ class HealthResponse(BaseModel):
     mongodb_connected: bool
     session_manager_enabled: bool
     model: str
+    fast_model: str
     embedding_model: str
     embedding_service: str
     uptime_seconds: float
@@ -385,6 +472,7 @@ class StatsResponse(BaseModel):
     total_chunks: int
     embedding_dimension: int
     model: str
+    fast_model: str
     embedding_model: str
     embedding_service: str
     max_chars_per_chunk: int
@@ -400,38 +488,29 @@ class StatsResponse(BaseModel):
 # HUGGINGFACE EMBEDDING CLIENT
 # -----------------------------
 class HFEmbeddingClient:
-    """Wrapper for HuggingFace Inference API embeddings"""
-
     def __init__(self, token: str, model: str = "sentence-transformers/all-MiniLM-L6-v2"):
         self.client = InferenceClient(token=token)
         self.model = model
 
     def encode(self, texts: List[str], normalize: bool = True) -> np.ndarray:
         embeddings = []
-
         for text in texts:
             try:
                 embedding = self.client.feature_extraction(text, model=self.model)
-
                 if isinstance(embedding, list):
                     embedding = np.array(embedding)
-
                 if embedding.ndim > 1:
                     embedding = embedding.mean(axis=0)
-
                 embeddings.append(embedding)
-
             except Exception as e:
                 print(f"Error encoding text: {e}")
                 embeddings.append(np.zeros(384))
 
         embeddings = np.array(embeddings, dtype=np.float32)
-
         if normalize:
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             norms = np.where(norms == 0, 1, norms)
             embeddings = embeddings / norms
-
         return embeddings
 
 
@@ -465,14 +544,12 @@ def load_embeddings(path: Path) -> np.ndarray:
 
 
 def format_citation(c: Dict[str, Any]) -> str:
-    """Format citation with proper spacing to prevent badge concatenation"""
     pages = f"pdf pages {c.get('page_start')}–{c.get('page_end')}"
     sub_num = c.get('subsection_number', 0)
     sub_title = c.get('subsection_title', 'Unknown')
     law_num = c.get('law_number')
     law_title = c.get('law_title')
 
-    # Handle subsection 0 (Introduction) specially
     if sub_num == 0:
         return (
             f"Law {law_num} – {law_title}, "
@@ -487,74 +564,68 @@ def format_citation(c: Dict[str, Any]) -> str:
 
 
 def expand_query_with_synonyms(query: str) -> str:
-    """Enhanced query expansion"""
+    """Rule-based query expansion (kept as a fallback/supplement to Gemini understanding)"""
     q_lower = query.lower()
     expansions = []
 
     synonym_map = {
-        # Core mappings
         "referee": ["match official", "touches a match official", "ball out of play", "dropped ball", "law 9"],
         "match official": ["referee", "touches a match official", "ball out of play", "dropped ball", "law 9"],
-        "ball hits referee": ["touches a match official", "law 9", "ball out of play", "dropped ball",
-                              "promising attack"],
-
-        # Goal scoring mappings
+        "ball hits referee": ["touches a match official", "law 9", "ball out of play", "dropped ball", "promising attack"],
         "throw-in": ["throw in", "Law 15", "awarded", "introduction"],
         "own goal": ["kicker's goal", "thrower's goal", "corner kick awarded", "goal kick awarded", "introduction"],
         "corner kick": ["corner", "Law 17", "introduction", "directly"],
         "goal kick": ["Law 16", "introduction", "directly", "penalty area"],
         "goalkeeper score": ["goal may be scored", "directly", "opposing team", "Law 16"],
-
-        # Other mappings
         "handball": ["handling the ball", "touches with hand", "law 12"],
         "fan": ["spectator", "outside agent", "interference"],
         "substitute": ["substitution", "law 3", "extra person"],
+        "shoulder charge": ["fair charge", "physical challenge", "playing distance", "ball within playing distance", "law 12"],
+        "shoulder charged": ["fair charge", "physical challenge", "playing distance", "ball within playing distance", "law 12"],
+        "charging": ["fair charge", "physical challenge", "law 12"],
+        "away from the ball": ["playing distance", "not within playing distance", "ball not within playing distance"],
+        "time wasting": ["delaying restart", "cautionable offense", "law 12"],
+        "diving": ["simulation", "deceive", "law 12", "cautionable"],
+        "encroachment": ["enters penalty area", "law 14", "inside penalty area before kick"],
+        "advantage": ["advantage clause", "law 12", "referee signals"],
     }
 
-    # Apply mappings
     for trigger, expansions_list in synonym_map.items():
         if trigger in q_lower:
             expansions.extend(expansions_list)
 
     if expansions:
-        expanded = query + " " + " ".join(expansions)
-        return expanded
+        return query + " " + " ".join(expansions)
     return query
 
 
 def extract_scenario_context(query: str) -> Dict[str, Any]:
     q = query.lower()
-    context = {
+    return {
         "involves_referee": any(term in q for term in ["referee", "match official", "ball hits"]),
         "involves_goalkeeper": any(term in q for term in ["goalkeeper", "goalie", "keeper"]),
         "into_own_goal": any(term in q for term in ["own goal", "into own", "thrower's goal", "kicker's goal"]),
         "directly": "directly" in q or "direct" in q,
         "can_score": any(term in q for term in ["can score", "may score", "score from"]),
     }
-    return context
 
 
 def detect_follow_up_question(question: str, conversation_history: List[Dict]) -> Dict[str, Any]:
-    """Detect if this is a follow-up question and extract context"""
     if not conversation_history:
         return {"is_follow_up": False}
 
     q_lower = question.lower()
-
-    # Follow-up indicators
     follow_up_patterns = [
         r'\b(what about|how about|and if|but what if|what if instead)\b',
         r'\b(also|additionally|furthermore|moreover)\b',
         r'\b(that|this|these|those|it|they)\b',
         r'^(and |but |so |then |however |although )',
-        r'\?$'  # Questions ending with ?
+        r'\?$'
     ]
-
     is_follow_up = any(re.search(pattern, q_lower) for pattern in follow_up_patterns)
 
-    # Extract referenced laws from recent history
     recent_laws = set()
-    for qa in conversation_history[-2:]:  # Last 2 Q&A pairs
+    for qa in conversation_history[-2:]:
         recent_laws.update(qa.get("evidence_laws", []))
 
     return {
@@ -566,11 +637,9 @@ def detect_follow_up_question(question: str, conversation_history: List[Dict]) -
 
 
 def extract_topic(conversation_history: List[Dict]) -> Optional[str]:
-    """Extract the main topic from conversation history"""
     if not conversation_history:
         return None
 
-    # Simple topic extraction from most recent questions
     recent_questions = [qa["question"] for qa in conversation_history[-2:]]
     combined = " ".join(recent_questions).lower()
 
@@ -583,7 +652,8 @@ def extract_topic(conversation_history: List[Dict]) -> Optional[str]:
         "goal kick": ["goal kick"],
         "throw-in": ["throw-in", "throw in"],
         "corner": ["corner"],
-        "substitution": ["substitute", "substitution"]
+        "substitution": ["substitute", "substitution"],
+        "foul": ["foul", "charge", "tackle", "shoulder"],
     }
 
     for topic, keywords in topics.items():
@@ -605,48 +675,55 @@ class HybridRetriever:
         self.bm25 = BM25Okapi(self.tokenized)
 
         self.embeddings = embeddings.astype("float32")
-
         dim = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(self.embeddings)
 
         print(f"Retriever initialized with {len(chunks)} chunks")
 
-    def route_rules(self, query: str, context_laws: List[int] = None) -> Dict[str, Any]:
+    def route_rules(self, query: str, context_laws: List[int] = None, extra_law_boost: set = None) -> Dict[str, Any]:
+        """Determine which laws and subsection terms to boost based on query keywords."""
         q = query.lower()
         law_boost = set()
         subsection_terms = []
 
-        # Add laws from conversation context
         if context_laws:
             law_boost.update(context_laws)
+        if extra_law_boost:
+            law_boost.update(extra_law_boost)
 
         # Ball hits referee
         if any(k in q for k in ["referee", "match official", "ball hits"]):
             law_boost.update([9, 8])
             subsection_terms += [
-                "touches a match official",
-                "ball out of play",
-                "ball in play",
-                "dropped ball",
-                "promising attack",
-                "possession changes",
+                "touches a match official", "ball out of play", "ball in play",
+                "dropped ball", "promising attack", "possession changes",
             ]
 
-        # Goal scoring questions
+        # Charging / physical challenges  (NEW)
+        if any(k in q for k in ["shoulder charge", "shoulder charged", "charging", "fair charge"]):
+            law_boost.add(12)
+            subsection_terms += ["fair charge", "physical challenge", "playing distance",
+                                  "ball within playing distance", "direct free kick"]
+
+        if any(k in q for k in ["away from the ball", "not near the ball", "off the ball"]):
+            law_boost.add(12)
+            subsection_terms += ["playing distance", "ball within playing distance", "direct free kick"]
+
+        # Goal scoring
         if "goal kick" in q or "goalkeeper score" in q:
             law_boost.add(16)
-            if "score" in q or "goal may" in q or "directly" in q:
+            if any(k in q for k in ["score", "goal may", "directly"]):
                 subsection_terms += ["introduction", "goal may be scored", "directly", "opposing team"]
 
         if "throw-in" in q:
             law_boost.add(15)
-            if "own goal" in q or "score" in q or "directly" in q:
+            if any(k in q for k in ["own goal", "score", "directly"]):
                 subsection_terms += ["introduction", "corner kick", "goal kick", "cannot be scored"]
 
         if "corner" in q:
             law_boost.add(17)
-            if "own goal" in q or "score" in q or "directly" in q:
+            if any(k in q for k in ["own goal", "score", "directly"]):
                 subsection_terms += ["introduction", "goal may be scored", "directly"]
 
         # Handball
@@ -666,10 +743,29 @@ class HybridRetriever:
         if any(k in q for k in ["substitute", "substitution", "sub"]):
             law_boost.add(3)
 
+        # Simulation / diving
+        if any(k in q for k in ["dive", "diving", "simulation", "cheat"]):
+            law_boost.add(12)
+            subsection_terms += ["simulation", "deceive", "caution", "yellow card"]
+
+        # Advantage
+        if "advantage" in q:
+            law_boost.add(12)
+            subsection_terms += ["advantage clause", "advantage", "referee signals"]
+
         return {"law_boost": law_boost, "subsection_terms": subsection_terms}
 
-    def search(self, query: str, top_k: int = 10, context_info: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        # Enhance query with context if it's a follow-up
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        context_info: Dict[str, Any] = None,
+        extra_law_boost: set = None,
+        extra_key_concepts: List[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Hybrid BM25 + dense retrieval with optional Gemini-enriched boosting.
+        """
         enhanced_query = query
         context_laws = []
 
@@ -678,17 +774,18 @@ class HybridRetriever:
             prev_question = context_info.get("previous_question")
             topic = context_info.get("conversation_topic")
 
-            # Add context to query
             context_parts = []
             if topic:
                 context_parts.append(topic)
             if prev_question:
-                # Take key terms from previous question
                 key_terms = [w for w in prev_question.split() if len(w) > 4][:3]
                 context_parts.extend(key_terms)
-
             if context_parts:
                 enhanced_query = query + " " + " ".join(context_parts)
+
+        # Append Gemini key concepts to the search query
+        if extra_key_concepts:
+            enhanced_query = enhanced_query + " " + " ".join(extra_key_concepts)
 
         expanded_query = expand_query_with_synonyms(enhanced_query)
         q_tokens = tokenize(expanded_query)
@@ -696,12 +793,11 @@ class HybridRetriever:
         bm25_top = np.argsort(bm25_scores)[::-1][: max(80, top_k * 10)]
 
         q_emb = self.hf_client.encode([expanded_query], normalize=True)
-
         _, sim_ids = self.index.search(q_emb, k=max(80, top_k * 10))
         sim_ids = sim_ids[0].tolist()
 
         cand_ids = list(dict.fromkeys(list(bm25_top) + sim_ids))
-        routing = self.route_rules(query, context_laws=context_laws)
+        routing = self.route_rules(query, context_laws=context_laws, extra_law_boost=extra_law_boost)
         law_boost = routing["law_boost"]
         subsection_terms = routing["subsection_terms"]
 
@@ -717,7 +813,6 @@ class HybridRetriever:
             if law_boost and c.get("law_number") in law_boost:
                 score *= 1.5
 
-            # Boost introduction chunks for goal-scoring and direct questions
             scenario = extract_scenario_context(query)
             if c.get("subsection_number") == 0:  # Introduction
                 if scenario["into_own_goal"] or scenario["directly"] or scenario["can_score"]:
@@ -755,17 +850,15 @@ class HybridRetriever:
 
 
 # -----------------------------
-# GEMINI ANSWER
+# CONTEXT BUILDER
 # -----------------------------
 def build_context(chunks: List[Dict[str, Any]], conversation_history: List[Dict] = None) -> str:
     parts = []
 
-    # Add conversation context if available
     if conversation_history and len(conversation_history) > 0:
         parts.append("[CONVERSATION CONTEXT]")
-        for i, qa in enumerate(conversation_history[-2:], 1):  # Last 2 Q&A
+        for i, qa in enumerate(conversation_history[-2:], 1):
             parts.append(f"Previous Q{i}: {qa['question']}")
-            # Add short answer preview
             answer_preview = qa['answer'][:200] + "..." if len(qa['answer']) > 200 else qa['answer']
             parts.append(f"Previous A{i}: {answer_preview}")
         parts.append("\n[CURRENT QUESTION EXTRACTS]\n")
@@ -789,8 +882,16 @@ def build_context(chunks: List[Dict[str, Any]], conversation_history: List[Dict]
     return "\n\n".join(parts)
 
 
-def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dict[str, Any] = None,
-                  conversation_history: List[Dict] = None) -> str:
+# -----------------------------
+# GEMINI ANSWER  (Step 3)
+# -----------------------------
+def gemini_answer(
+    question: str,
+    chunks: List[Dict[str, Any]],
+    context_info: Dict[str, Any] = None,
+    conversation_history: List[Dict] = None,
+    query_understanding: Dict[str, Any] = None
+) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY.")
 
@@ -814,10 +915,19 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
     if scenario["can_score"]:
         scenario_hints.append("This is asking whether a goal can be scored in this situation.")
 
-    # Add follow-up context
     if context_info and context_info.get("is_follow_up"):
         scenario_hints.append(
-            f"This is a follow-up question related to: {context_info.get('conversation_topic', 'previous discussion')}")
+            f"This is a follow-up question related to: {context_info.get('conversation_topic', 'previous discussion')}"
+        )
+
+    # Add Gemini query understanding hints
+    if query_understanding:
+        note = query_understanding.get("interpretation_note", "")
+        if note:
+            scenario_hints.append(f"Query interpretation note: {note}")
+        rewritten = query_understanding.get("rewritten_query", "")
+        if rewritten and rewritten != question:
+            scenario_hints.append(f"Technically precise version of this question: {rewritten}")
 
     scenario_text = "\n".join(scenario_hints) if scenario_hints else "General scenario."
 
@@ -853,8 +963,6 @@ def gemini_answer(question: str, chunks: List[Dict[str, Any]], context_info: Dic
         "in the main explanation. Just write the answer naturally in flowing prose.\n\n"
         "After your explanation, add a structured evidence section:\n\n"
         "**Supporting Evidence:**\n\n"
-        "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
-        "\"Quote from the law that supports the answer\"\n\n"
         "**Law X – Title, Subsection** (pdf pages Y–Z)\n"
         "\"Quote from the law that supports the answer\"\n\n"
         "RULES:\n"
@@ -903,7 +1011,6 @@ start_time = time.time()
 async def lifespan(app: FastAPI):
     global retriever, hf_client, mongo_counter, session_manager
 
-    # Initialize MongoDB counter
     mongo_db = None
     if MONGODB_URI:
         try:
@@ -925,11 +1032,9 @@ async def lifespan(app: FastAPI):
         logger.warning("MONGODB_URI not found. Running without persistent counter.")
         mongo_counter = None
 
-    # Initialize session manager
     session_manager = SessionManager(mongo_db=mongo_db)
     logger.info("Session manager initialized")
 
-    # Initialize retriever
     if not HF_TOKEN:
         logger.warning("HF_TOKEN not found. Starting API without retriever.")
         yield
@@ -961,15 +1066,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Cleanup
     if mongo_counter:
         mongo_counter.close()
 
 
 app = FastAPI(
     title="Football Laws of the Game RAG API",
-    description="Session-aware RAG with context for follow-up questions",
-    version="2.5.0",
+    description="Gemini Query Understanding + Session-aware RAG",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -986,8 +1090,12 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "2.5.0",
-        "improvements": "Session-level context awareness for follow-up questions",
+        "version": "3.0.0",
+        "improvements": [
+            "Gemini query understanding step before retrieval",
+            "Expanded synonym map (shoulder charge, diving, advantage, etc.)",
+            "Session-level context awareness for follow-up questions"
+        ],
         "storage": "MongoDB Atlas",
         "endpoints": {
             "/ask": "POST - Ask a question (with optional X-Session-ID header)",
@@ -1001,24 +1109,19 @@ async def root():
 
 @app.post("/session/new")
 async def create_new_session():
-    """Create a new conversation session"""
     if not session_manager:
         raise HTTPException(status_code=503, detail="Session manager not available")
-
     session_id = session_manager.create_session()
     return {"session_id": session_id, "message": "New session created"}
 
 
 @app.get("/session/{session_id}", response_model=SessionResponse)
 async def get_session(session_id: str):
-    """Get conversation history for a session"""
     if not session_manager:
         raise HTTPException(status_code=503, detail="Session manager not available")
-
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
-
     return SessionResponse(
         session_id=session["session_id"],
         created_at=session["created_at"].isoformat(),
@@ -1030,13 +1133,13 @@ async def get_session(session_id: str):
 async def health_check():
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialised")
-
     return HealthResponse(
         status="healthy",
         retriever_loaded=True,
         mongodb_connected=mongo_counter is not None and mongo_counter.is_connected(),
         session_manager_enabled=session_manager is not None,
         model=GEMINI_MODEL,
+        fast_model=GEMINI_FAST_MODEL,
         embedding_model=EMBED_MODEL_NAME,
         embedding_service="HuggingFace Inference API",
         uptime_seconds=time.time() - start_time
@@ -1061,6 +1164,7 @@ async def get_stats():
         total_chunks=len(retriever.chunks),
         embedding_dimension=retriever.embeddings.shape[1],
         model=GEMINI_MODEL,
+        fast_model=GEMINI_FAST_MODEL,
         embedding_model=EMBED_MODEL_NAME,
         embedding_service="HuggingFace Inference API",
         max_chars_per_chunk=MAX_CHARS_PER_CHUNK,
@@ -1073,10 +1177,13 @@ async def get_stats():
     )
 
 
+# -----------------------------------------------------------------------
+# /ask  – main endpoint (same interface as before, no frontend changes)
+# -----------------------------------------------------------------------
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(
-        request: QuestionRequest,
-        x_session_id: Optional[str] = Header(None, alias="X-Session-ID")
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID")
 ):
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not initialised")
@@ -1085,77 +1192,89 @@ async def ask_question(
         logger.info("Received /ask request. question=%s, session_id=%s", request.question, x_session_id)
         start = time.time()
 
-        # Get or create session
+        # ── Session management ─────────────────────────────────────────
         session = None
         if session_manager:
             if x_session_id:
                 session = session_manager.get_session(x_session_id)
                 if not session:
-                    # Create new session if provided ID is invalid
                     x_session_id = session_manager.create_session()
                     session = session_manager.get_session(x_session_id)
             else:
-                # No session ID provided, create new one
                 x_session_id = session_manager.create_session()
                 session = session_manager.get_session(x_session_id)
 
-        # Detect if this is a follow-up question
-        context_info = None
-        conversation_history = []
-        if session:
-            conversation_history = session.get("conversation_history", [])
-            context_info = detect_follow_up_question(request.question, conversation_history)
-            logger.info("Context detection: %s", context_info)
+        conversation_history = session.get("conversation_history", []) if session else []
 
-        # Search with context awareness
+        # ── Follow-up detection ────────────────────────────────────────
+        context_info = detect_follow_up_question(request.question, conversation_history)
+        logger.info("Context detection: %s", context_info)
+
+        # ── STEP 1: Gemini Query Understanding ─────────────────────────
+        t_understand_start = time.time()
+        query_understanding = understand_query(request.question, conversation_history)
+        t_understand_ms = (time.time() - t_understand_start) * 1000
+        logger.info(
+            "Query understanding (%.0fms): rewritten='%s', laws=%s, concepts=%s",
+            t_understand_ms,
+            query_understanding["rewritten_query"],
+            query_understanding["likely_laws"],
+            query_understanding["key_concepts"]
+        )
+
+        # ── STEP 2: Hybrid RAG retrieval with enriched signals ─────────
         top_chunks = retriever.search(
-            request.question,
+            query=query_understanding["rewritten_query"],   # use enriched query
             top_k=request.top_k,
-            context_info=context_info
-        )
-
-        # Generate answer with conversation history
-        answer = gemini_answer(
-            request.question,
-            top_chunks,
             context_info=context_info,
-            conversation_history=conversation_history
+            extra_law_boost=set(query_understanding["likely_laws"]),
+            extra_key_concepts=query_understanding["key_concepts"]
         )
 
-        # Build evidence list
+        # ── STEP 3: Gemini final answer ────────────────────────────────
+        answer = gemini_answer(
+            question=request.question,          # original question for the user-facing prompt
+            chunks=top_chunks,
+            context_info=context_info,
+            conversation_history=conversation_history,
+            query_understanding=query_understanding
+        )
+
+        # ── Build evidence list ────────────────────────────────────────
         evidence_list = []
         for i, chunk in enumerate(top_chunks, 1):
-            text_preview = chunk.get("text", "")[:200] + "..." if len(chunk.get("text", "")) > 200 else chunk.get(
-                "text", "")
+            raw_text = chunk.get("text", "")
+            text_preview = raw_text[:200] + "..." if len(raw_text) > 200 else raw_text
             evidence_list.append(
                 Evidence(
                     rank=i,
                     citation=format_citation(chunk),
                     text_preview=text_preview,
-                    full_text=chunk.get("text", "") if request.include_raw_chunks else None,
+                    full_text=raw_text if request.include_raw_chunks else None,
                     law_number=chunk.get("law_number")
                 )
             )
 
-        # Update session with this Q&A
-        # In your /ask endpoint, replace the update_session call with:
-        try:
-            if session_manager and x_session_id:
-                session_manager.update_session(
-                    x_session_id,
-                    request.question,
-                    answer,
-                    [{"law_number": e.law_number} for e in evidence_list]
-                )
-        except Exception as e:
-            logger.warning("Session update failed (non-fatal): %s", e)
-            # Continue — don't let session write failure kill the response
+        # ── Update session ─────────────────────────────────────────────
+        if session_manager and x_session_id:
+            session_manager.update_session(
+                x_session_id,
+                request.question,
+                answer,
+                [{"law_number": e.law_number} for e in evidence_list]
+            )
 
-        routing = retriever.route_rules(request.question)
+        # ── Build retrieval_info ───────────────────────────────────────
+        routing = retriever.route_rules(
+            request.question,
+            extra_law_boost=set(query_understanding["likely_laws"])
+        )
         scenario = extract_scenario_context(request.question)
 
         retrieval_info = {
-            "expanded_query": expand_query_with_synonyms(request.question),
+            "original_query": request.question,
+            "rewritten_query": query_understanding["rewritten_query"],
+            "query_understanding_ms": round(t_understand_ms, 1),
             "boosted_laws": list(routing["law_boost"]) if routing["law_boost"] else [],
             "scenario_context": scenario,
             "chunks_retrieved": len(top_chunks),
@@ -1165,7 +1284,7 @@ async def ask_question(
 
         processing_time = (time.time() - start) * 1000
 
-        # Increment counter in MongoDB
+        # ── Counter ────────────────────────────────────────────────────
         if mongo_counter and mongo_counter.is_connected():
             latest_count, counter_persisted = mongo_counter.increment()
             retrieval_info["query_counter"] = {
@@ -1181,7 +1300,7 @@ async def ask_question(
                 "error": "MongoDB not connected"
             }
 
-        # Build conversation context for response
+        # ── Conversation context for response ──────────────────────────
         conversation_context_response = None
         if conversation_history:
             conversation_context_response = [
@@ -1191,12 +1310,13 @@ async def ask_question(
                     answer_preview=qa["answer"][:150] + "..." if len(qa["answer"]) > 150 else qa["answer"],
                     laws_referenced=qa.get("evidence_laws", [])
                 )
-                for qa in conversation_history[-3:]  # Last 3 Q&As
+                for qa in conversation_history[-3:]
             ]
 
         logger.info(
-            "Completed /ask request. processing_time_ms=%.2f counter=%s session=%s",
+            "Completed /ask. total=%.0fms (understand=%.0fms) counter=%s session=%s",
             processing_time,
+            t_understand_ms,
             retrieval_info["query_counter"]["value"],
             x_session_id
         )
@@ -1208,7 +1328,8 @@ async def ask_question(
             retrieval_info=retrieval_info,
             processing_time_ms=processing_time,
             session_id=x_session_id or "none",
-            conversation_context=conversation_context_response
+            conversation_context=conversation_context_response,
+            query_understanding=QueryUnderstanding(**query_understanding)
         )
 
     except Exception as e:
@@ -1218,5 +1339,4 @@ async def ask_question(
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
