@@ -1138,13 +1138,18 @@ async def ask_question(
             )
 
         # Update session with this Q&A
-        if session_manager and x_session_id:
-            session_manager.update_session(
-                x_session_id,
-                request.question,
-                answer,
-                [{"law_number": e.law_number} for e in evidence_list]
-            )
+        # In your /ask endpoint, replace the update_session call with:
+        try:
+            if session_manager and x_session_id:
+                session_manager.update_session(
+                    x_session_id,
+                    request.question,
+                    answer,
+                    [{"law_number": e.law_number} for e in evidence_list]
+                )
+        except Exception as e:
+            logger.warning("Session update failed (non-fatal): %s", e)
+            # Continue — don't let session write failure kill the response
 
         routing = retriever.route_rules(request.question)
         scenario = extract_scenario_context(request.question)
