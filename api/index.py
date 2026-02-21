@@ -1,6 +1,6 @@
 """
 Enhanced Football Laws of the Game RAG API
-Version 3.1.1 - Greeting interception + all previous fixes
+Version 3.0.0 - Gemini Query Understanding + Hybrid RAG
 """
 import os
 import json
@@ -34,20 +34,24 @@ EMBEDDINGS_PATH = BASE_DIR / "rag_chunks" / "embeddings.npy"
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_FAST_MODEL = "gemini-2.0-flash"
+GEMINI_FAST_MODEL = "gemini-2.0-flash"   # Used for query understanding (cheaper/faster)
 TOP_K = 10
 
+# context controls
 MAX_CHARS_PER_CHUNK = 2500
 MAX_TOTAL_CONTEXT_CHARS = 15000
 
+# session management
 SESSION_TIMEOUT_MINUTES = 30
 MAX_CONVERSATION_HISTORY = 5
 
+# MongoDB configuration
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "fcrules")
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "query_stats")
 MONGODB_SESSIONS_COLLECTION = os.getenv("MONGODB_SESSIONS_COLLECTION", "sessions")
 
+# API keys from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
@@ -67,82 +71,41 @@ counter_lock = threading.Lock()
 
 
 # -----------------------------
-# GREETING / META INTERCEPTOR  (NEW)
-# -----------------------------
-# Patterns that match casual greetings or identity questions — NOT football law questions
-_GREETING_PATTERNS = [
-    # Greetings
-    r"^(hi|hello|hey|hiya|howdy|sup|yo|greetings|salaam|salam|assalam|good\s*(morning|afternoon|evening|night))[.!?,\s]*$",
-    # How are you variants
-    r"^how are (you|u)[.!?\s]*$",
-    r"^how('s| is) it going[.!?\s]*$",
-    r"^what'?s up[.!?\s]*$",
-    r"^you alright[.!?\s]*$",
-    # Identity / capability questions
-    r"^who are you[.!?\s]*$",
-    r"^what (are|do) you[.!?\s]*$",
-    r"^what can you (do|help)[.!?\s]*$",
-    r"^what is this[.!?\s]*$",
-    r"^tell me about yourself[.!?\s]*$",
-    # Thanks
-    r"^(thanks?|thank you|cheers|ta|thx)[.!?\s]*$",
-    # Bye
-    r"^(bye|goodbye|see you|cya|later|take care)[.!?\s]*$",
-]
-
-_COMPILED_GREETINGS = [re.compile(p, re.IGNORECASE) for p in _GREETING_PATTERNS]
-
-
-def is_greeting_or_meta(question: str) -> bool:
-    """Return True if the question is a greeting or identity query, not a football law question."""
-    q = question.strip()
-    return any(p.search(q) for p in _COMPILED_GREETINGS)
-
-
-def get_greeting_response(question: str) -> str:
-    """Return a friendly, on-brand response for greetings/meta questions."""
-    q = question.strip().lower()
-
-    # Farewell
-    if any(w in q for w in ["bye", "goodbye", "see you", "cya", "later", "take care"]):
-        return "See you on the pitch! Come back any time you have a football law question."
-
-    # Thanks
-    if any(w in q for w in ["thanks", "thank you", "cheers", "ta", "thx"]):
-        return "You're welcome! If you have any more questions about the Laws of the Game, feel free to ask."
-
-    # How are you / what's up
-    if any(w in q for w in ["how are", "how's it", "what's up", "you alright"]):
-        return "Doing well and ready to help! I'm here to help you understand the beautiful game — ask me anything about the Laws of the Game."
-
-    # Default greeting / identity / capability
-    return (
-        "I'm here to help you understand the beautiful game! "
-        "I'm a football laws assistant powered by the official IFAB Laws of the Game. "
-        "You can ask me about fouls, offside, handball, penalties, restarts, cards, "
-        "or any other rule — and I'll give you a precise, law-backed answer."
-    )
-
-
-# -----------------------------
-# GEMINI QUERY UNDERSTANDING  (Step 1)
+# GEMINI QUERY UNDERSTANDING  (NEW - Step 1)
 # -----------------------------
 def understand_query(question: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
     """
     Step 1: Use a fast Gemini model to interpret, disambiguate, and enrich
     the user's question before hitting the retriever.
+
+    Returns a dict with:
+      - rewritten_query: technically precise version of the question
+      - likely_laws: list of law numbers most likely relevant
+      - key_concepts: list of key football-law terms to search
+      - interpretation_note: brief note on any ambiguity
     """
     if not GEMINI_API_KEY:
         logger.warning("No GEMINI_API_KEY – skipping query understanding")
-        return {"rewritten_query": question, "likely_laws": [], "key_concepts": [], "interpretation_note": ""}
+        return {
+            "rewritten_query": question,
+            "likely_laws": [],
+            "key_concepts": [],
+            "interpretation_note": ""
+        }
 
     try:
         from google import genai
         from google.genai import types
     except Exception as e:
         logger.error("Unable to import google-genai for query understanding: %s", e)
-        return {"rewritten_query": question, "likely_laws": [], "key_concepts": [], "interpretation_note": ""}
+        return {
+            "rewritten_query": question,
+            "likely_laws": [],
+            "key_concepts": [],
+            "interpretation_note": ""
+        }
 
+    # Build a short conversation context string if we have history
     history_text = ""
     if conversation_history:
         recent = conversation_history[-2:]
@@ -193,8 +156,6 @@ Key terminology tips:
 - "own goal" → "kicker's own goal", "thrower's own goal", "corner kick awarded", "Law 10"
 - "offside trap" → "offside position", "Law 11", "active play"
 - "time wasting" → "delaying restart", "Law 12", "cautionable offense"
-- "diving" → "simulation", "deceive the referee", "unsporting behaviour", "indirect free kick restart", "Law 12", "Law 13"
-- "simulation" → "indirect free kick", "restart", "unsporting behaviour", "caution", "Law 12", "Law 13"
 """
 
     try:
@@ -205,9 +166,11 @@ Key terminology tips:
             config=types.GenerateContentConfig(temperature=0.0),
         )
         text = (resp.text or "").strip()
+        # Strip any accidental markdown fences
         text = re.sub(r"```json|```", "", text).strip()
         result = json.loads(text)
 
+        # Validate and sanitise
         return {
             "rewritten_query": str(result.get("rewritten_query", question)),
             "likely_laws": [int(x) for x in result.get("likely_laws", []) if str(x).isdigit()],
@@ -217,7 +180,12 @@ Key terminology tips:
 
     except Exception as e:
         logger.warning("Query understanding failed (%s); falling back to raw query", e)
-        return {"rewritten_query": question, "likely_laws": [], "key_concepts": [], "interpretation_note": ""}
+        return {
+            "rewritten_query": question,
+            "likely_laws": [],
+            "key_concepts": [],
+            "interpretation_note": ""
+        }
 
 
 # -----------------------------
@@ -242,23 +210,6 @@ class SessionManager:
             except Exception as e:
                 logger.warning("Could not create TTL index: %s", e)
 
-    @staticmethod
-    def _normalize_datetimes(session: dict) -> dict:
-        """
-        FIX: MongoDB returns timezone-naive datetimes. Ensure all datetime
-        fields are timezone-aware (UTC) so comparisons with datetime.now(timezone.utc)
-        never raise TypeError.
-        """
-        for field in ("last_activity", "created_at"):
-            val = session.get(field)
-            if val and isinstance(val, datetime) and val.tzinfo is None:
-                session[field] = val.replace(tzinfo=timezone.utc)
-        for qa in session.get("conversation_history", []):
-            ts = qa.get("timestamp")
-            if ts and isinstance(ts, datetime) and ts.tzinfo is None:
-                qa["timestamp"] = ts.replace(tzinfo=timezone.utc)
-        return session
-
     def create_session(self) -> str:
         session_id = str(uuid.uuid4())
         session_data = {
@@ -278,18 +229,35 @@ class SessionManager:
         return session_id
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session data by ID"""
+
+        def _normalize_datetimes(session: dict) -> dict:
+            """Ensure all datetime fields are timezone-aware (MongoDB returns naive datetimes)"""
+            for field in ("last_activity", "created_at"):
+                val = session.get(field)
+                if val and isinstance(val, datetime) and val.tzinfo is None:
+                    session[field] = val.replace(tzinfo=timezone.utc)
+            # Also fix datetimes nested inside conversation_history
+            for qa in session.get("conversation_history", []):
+                ts = qa.get("timestamp")
+                if ts and isinstance(ts, datetime) and ts.tzinfo is None:
+                    qa["timestamp"] = ts.replace(tzinfo=timezone.utc)
+            return session
+
+        # Try memory first
         if session_id in self.sessions:
-            session = self._normalize_datetimes(self.sessions[session_id])
+            session = _normalize_datetimes(self.sessions[session_id])
             if datetime.now(timezone.utc) - session["last_activity"] > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
                 self.delete_session(session_id)
                 return None
             return session
 
+        # Try MongoDB
         if self.sessions_collection is not None:
             try:
                 session = self.sessions_collection.find_one({"session_id": session_id})
                 if session:
-                    session = self._normalize_datetimes(session)
+                    session = _normalize_datetimes(session)
                     self.sessions[session_id] = session
                     return session
             except Exception as e:
@@ -342,7 +310,7 @@ class SessionManager:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
         expired = [
             sid for sid, session in self.sessions.items()
-            if self._normalize_datetimes(session)["last_activity"] < cutoff
+            if session["last_activity"] < cutoff
         ]
         for sid in expired:
             del self.sessions[sid]
@@ -378,7 +346,11 @@ class MongoDBCounter:
 
             result = self.collection.find_one({"_id": "query_counter"})
             if result is None:
-                self.collection.insert_one({"_id": "query_counter", "count": 0, "last_updated": time.time()})
+                self.collection.insert_one({
+                    "_id": "query_counter",
+                    "count": 0,
+                    "last_updated": time.time()
+                })
                 logger.info("Initialized new query counter in MongoDB")
             else:
                 logger.info("Connected to MongoDB. Current count: %s", result.get("count", 0))
@@ -410,7 +382,9 @@ class MongoDBCounter:
                 return 0
         try:
             result = self.collection.find_one({"_id": "query_counter"})
-            return int(result.get("count", 0)) if result else 0
+            if result:
+                return int(result.get("count", 0))
+            return 0
         except Exception as e:
             logger.error("Error reading count from MongoDB: %s", e)
             return 0
@@ -422,7 +396,10 @@ class MongoDBCounter:
         try:
             result = self.collection.find_one_and_update(
                 {"_id": "query_counter"},
-                {"$inc": {"count": 1}, "$set": {"last_updated": time.time()}},
+                {
+                    "$inc": {"count": 1},
+                    "$set": {"last_updated": time.time()}
+                },
                 return_document=True,
                 upsert=True
             )
@@ -488,7 +465,7 @@ class QuestionResponse(BaseModel):
     processing_time_ms: Optional[float] = None
     session_id: str
     conversation_context: Optional[List[ConversationContext]] = None
-    query_understanding: Optional[QueryUnderstanding] = None
+    query_understanding: Optional[QueryUnderstanding] = None  # NEW – visible in response
 
 
 class SessionResponse(BaseModel):
@@ -527,14 +504,10 @@ class StatsResponse(BaseModel):
 
 # -----------------------------
 # HUGGINGFACE EMBEDDING CLIENT
-# FIX: Updated to router.huggingface.co — old api-inference endpoint is deprecated
 # -----------------------------
 class HFEmbeddingClient:
     def __init__(self, token: str, model: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.client = InferenceClient(
-            token=token,
-            base_url="https://router.huggingface.co"
-        )
+        self.client = InferenceClient(token=token)
         self.model = model
 
     def encode(self, texts: List[str], normalize: bool = True) -> np.ndarray:
@@ -596,12 +569,20 @@ def format_citation(c: Dict[str, Any]) -> str:
     law_title = c.get('law_title')
 
     if sub_num == 0:
-        return f"Law {law_num} – {law_title}, Introduction ({pages})"
+        return (
+            f"Law {law_num} – {law_title}, "
+            f"Introduction ({pages})"
+        )
     else:
-        return f"Law {law_num} – {law_title}, Section {sub_num}: {sub_title} ({pages})"
+        return (
+            f"Law {law_num} – {law_title}, "
+            f"Section {sub_num}: {sub_title} "
+            f"({pages})"
+        )
 
 
 def expand_query_with_synonyms(query: str) -> str:
+    """Rule-based query expansion (kept as a fallback/supplement to Gemini understanding)"""
     q_lower = query.lower()
     expansions = []
 
@@ -622,8 +603,7 @@ def expand_query_with_synonyms(query: str) -> str:
         "charging": ["fair charge", "physical challenge", "law 12"],
         "away from the ball": ["playing distance", "not within playing distance", "ball not within playing distance"],
         "time wasting": ["delaying restart", "cautionable offense", "law 12"],
-        "diving": ["simulation", "deceive", "unsporting behaviour", "indirect free kick", "law 12", "law 13"],
-        "simulation": ["indirect free kick", "restart", "unsporting behaviour", "caution", "yellow card", "law 12", "law 13"],
+        "diving": ["simulation", "deceive", "law 12", "cautionable"],
         "encroachment": ["enters penalty area", "law 14", "inside penalty area before kick"],
         "advantage": ["advantage clause", "law 12", "referee signals"],
     }
@@ -720,6 +700,7 @@ class HybridRetriever:
         print(f"Retriever initialized with {len(chunks)} chunks")
 
     def route_rules(self, query: str, context_laws: List[int] = None, extra_law_boost: set = None) -> Dict[str, Any]:
+        """Determine which laws and subsection terms to boost based on query keywords."""
         q = query.lower()
         law_boost = set()
         subsection_terms = []
@@ -729,11 +710,15 @@ class HybridRetriever:
         if extra_law_boost:
             law_boost.update(extra_law_boost)
 
+        # Ball hits referee
         if any(k in q for k in ["referee", "match official", "ball hits"]):
             law_boost.update([9, 8])
-            subsection_terms += ["touches a match official", "ball out of play", "ball in play",
-                                  "dropped ball", "promising attack", "possession changes"]
+            subsection_terms += [
+                "touches a match official", "ball out of play", "ball in play",
+                "dropped ball", "promising attack", "possession changes",
+            ]
 
+        # Charging / physical challenges  (NEW)
         if any(k in q for k in ["shoulder charge", "shoulder charged", "charging", "fair charge"]):
             law_boost.add(12)
             subsection_terms += ["fair charge", "physical challenge", "playing distance",
@@ -743,6 +728,7 @@ class HybridRetriever:
             law_boost.add(12)
             subsection_terms += ["playing distance", "ball within playing distance", "direct free kick"]
 
+        # Goal scoring
         if "goal kick" in q or "goalkeeper score" in q:
             law_boost.add(16)
             if any(k in q for k in ["score", "goal may", "directly"]):
@@ -758,24 +744,29 @@ class HybridRetriever:
             if any(k in q for k in ["own goal", "score", "directly"]):
                 subsection_terms += ["introduction", "goal may be scored", "directly"]
 
+        # Handball
         if any(k in q for k in ["handball", "hand", "arm"]):
             law_boost.add(12)
             subsection_terms += ["handball", "handling the ball", "direct free kick"]
 
+        # Offside
         if "offside" in q:
             law_boost.add(11)
 
+        # Penalty
         if "penalty" in q:
             law_boost.add(14)
 
+        # Substitution
         if any(k in q for k in ["substitute", "substitution", "sub"]):
             law_boost.add(3)
 
-        if any(k in q for k in ["dive", "diving", "simulation", "simulate", "cheat"]):
-            law_boost.update([12, 13])
-            subsection_terms += ["simulation", "deceive", "caution", "yellow card",
-                                  "indirect free kick", "unsporting behaviour"]
+        # Simulation / diving
+        if any(k in q for k in ["dive", "diving", "simulation", "cheat"]):
+            law_boost.add(12)
+            subsection_terms += ["simulation", "deceive", "caution", "yellow card"]
 
+        # Advantage
         if "advantage" in q:
             law_boost.add(12)
             subsection_terms += ["advantage clause", "advantage", "referee signals"]
@@ -790,6 +781,9 @@ class HybridRetriever:
         extra_law_boost: set = None,
         extra_key_concepts: List[str] = None
     ) -> List[Dict[str, Any]]:
+        """
+        Hybrid BM25 + dense retrieval with optional Gemini-enriched boosting.
+        """
         enhanced_query = query
         context_laws = []
 
@@ -807,6 +801,7 @@ class HybridRetriever:
             if context_parts:
                 enhanced_query = query + " " + " ".join(context_parts)
 
+        # Append Gemini key concepts to the search query
         if extra_key_concepts:
             enhanced_query = enhanced_query + " " + " ".join(extra_key_concepts)
 
@@ -837,7 +832,7 @@ class HybridRetriever:
                 score *= 1.5
 
             scenario = extract_scenario_context(query)
-            if c.get("subsection_number") == 0:
+            if c.get("subsection_number") == 0:  # Introduction
                 if scenario["into_own_goal"] or scenario["directly"] or scenario["can_score"]:
                     score *= 1.5
                 else:
@@ -943,6 +938,7 @@ def gemini_answer(
             f"This is a follow-up question related to: {context_info.get('conversation_topic', 'previous discussion')}"
         )
 
+    # Add Gemini query understanding hints
     if query_understanding:
         note = query_understanding.get("interpretation_note", "")
         if note:
@@ -1036,7 +1032,11 @@ async def lifespan(app: FastAPI):
     mongo_db = None
     if MONGODB_URI:
         try:
-            mongo_counter = MongoDBCounter(uri=MONGODB_URI, database=MONGODB_DATABASE, collection=MONGODB_COLLECTION)
+            mongo_counter = MongoDBCounter(
+                uri=MONGODB_URI,
+                database=MONGODB_DATABASE,
+                collection=MONGODB_COLLECTION
+            )
             if mongo_counter.connect():
                 logger.info("MongoDB counter initialized successfully")
                 mongo_db = mongo_counter.db
@@ -1091,7 +1091,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Football Laws of the Game RAG API",
     description="Gemini Query Understanding + Session-aware RAG",
-    version="3.1.1",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -1108,12 +1108,11 @@ app.add_middleware(
 async def root():
     return {
         "message": "Football Laws of the Game RAG API",
-        "version": "3.1.1",
-        "fixes": [
-            "FIX 1: timezone-naive datetime from MongoDB resolved — no more 500 on 2nd question",
-            "FIX 2: HuggingFace InferenceClient updated to router.huggingface.co",
-            "FIX 3: diving/simulation expanded to retrieve indirect free kick restart (Law 13)",
-            "NEW: greeting/meta-question interception — friendly response instead of law lookup"
+        "version": "3.0.0",
+        "improvements": [
+            "Gemini query understanding step before retrieval",
+            "Expanded synonym map (shoulder charge, diving, advantage, etc.)",
+            "Session-level context awareness for follow-up questions"
         ],
         "storage": "MongoDB Atlas",
         "endpoints": {
@@ -1160,7 +1159,7 @@ async def health_check():
         model=GEMINI_MODEL,
         fast_model=GEMINI_FAST_MODEL,
         embedding_model=EMBED_MODEL_NAME,
-        embedding_service="HuggingFace Inference API (router.huggingface.co)",
+        embedding_service="HuggingFace Inference API",
         uptime_seconds=time.time() - start_time
     )
 
@@ -1172,7 +1171,11 @@ async def get_stats():
 
     unique_laws = sorted(list(set(c.get("law_number") for c in retriever.chunks if c.get("law_number"))))
     intro_count = sum(1 for c in retriever.chunks if c.get("subsection_number") == 0)
-    query_count = mongo_counter.get_count() if (mongo_counter and mongo_counter.is_connected()) else 0
+
+    query_count = 0
+    if mongo_counter and mongo_counter.is_connected():
+        query_count = mongo_counter.get_count()
+
     active_sessions = len(session_manager.sessions) if session_manager else 0
 
     return StatsResponse(
@@ -1181,7 +1184,7 @@ async def get_stats():
         model=GEMINI_MODEL,
         fast_model=GEMINI_FAST_MODEL,
         embedding_model=EMBED_MODEL_NAME,
-        embedding_service="HuggingFace Inference API (router.huggingface.co)",
+        embedding_service="HuggingFace Inference API",
         max_chars_per_chunk=MAX_CHARS_PER_CHUNK,
         max_total_context_chars=MAX_TOTAL_CONTEXT_CHARS,
         unique_laws=unique_laws,
@@ -1193,7 +1196,7 @@ async def get_stats():
 
 
 # -----------------------------------------------------------------------
-# /ask  – main endpoint
+# /ask  – main endpoint (same interface as before, no frontend changes)
 # -----------------------------------------------------------------------
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(
@@ -1221,25 +1224,6 @@ async def ask_question(
 
         conversation_history = session.get("conversation_history", []) if session else []
 
-        # ── GREETING INTERCEPTOR (NEW) ─────────────────────────────────
-        # Check before any expensive API calls — instant response, zero cost
-        if is_greeting_or_meta(request.question):
-            greeting_answer = get_greeting_response(request.question)
-            logger.info("Greeting intercepted: '%s'", request.question)
-            return QuestionResponse(
-                question=request.question,
-                answer=greeting_answer,
-                evidence=[],
-                retrieval_info={
-                    "note": "greeting intercepted — no retrieval performed",
-                    "query_counter": {"value": 0, "persisted": False, "storage": "none"}
-                },
-                processing_time_ms=round((time.time() - start) * 1000, 1),
-                session_id=x_session_id or "none",
-                conversation_context=None,
-                query_understanding=None
-            )
-
         # ── Follow-up detection ────────────────────────────────────────
         context_info = detect_follow_up_question(request.question, conversation_history)
         logger.info("Context detection: %s", context_info)
@@ -1256,9 +1240,9 @@ async def ask_question(
             query_understanding["key_concepts"]
         )
 
-        # ── STEP 2: Hybrid RAG retrieval ───────────────────────────────
+        # ── STEP 2: Hybrid RAG retrieval with enriched signals ─────────
         top_chunks = retriever.search(
-            query=query_understanding["rewritten_query"],
+            query=query_understanding["rewritten_query"],   # use enriched query
             top_k=request.top_k,
             context_info=context_info,
             extra_law_boost=set(query_understanding["likely_laws"]),
@@ -1267,7 +1251,7 @@ async def ask_question(
 
         # ── STEP 3: Gemini final answer ────────────────────────────────
         answer = gemini_answer(
-            question=request.question,
+            question=request.question,          # original question for the user-facing prompt
             chunks=top_chunks,
             context_info=context_info,
             conversation_history=conversation_history,
@@ -1299,7 +1283,10 @@ async def ask_question(
             )
 
         # ── Build retrieval_info ───────────────────────────────────────
-        routing = retriever.route_rules(request.question, extra_law_boost=set(query_understanding["likely_laws"]))
+        routing = retriever.route_rules(
+            request.question,
+            extra_law_boost=set(query_understanding["likely_laws"])
+        )
         scenario = extract_scenario_context(request.question)
 
         retrieval_info = {
@@ -1318,9 +1305,18 @@ async def ask_question(
         # ── Counter ────────────────────────────────────────────────────
         if mongo_counter and mongo_counter.is_connected():
             latest_count, counter_persisted = mongo_counter.increment()
-            retrieval_info["query_counter"] = {"value": latest_count, "persisted": counter_persisted, "storage": "mongodb"}
+            retrieval_info["query_counter"] = {
+                "value": latest_count,
+                "persisted": counter_persisted,
+                "storage": "mongodb"
+            }
         else:
-            retrieval_info["query_counter"] = {"value": 0, "persisted": False, "storage": "none", "error": "MongoDB not connected"}
+            retrieval_info["query_counter"] = {
+                "value": 0,
+                "persisted": False,
+                "storage": "none",
+                "error": "MongoDB not connected"
+            }
 
         # ── Conversation context for response ──────────────────────────
         conversation_context_response = None
@@ -1337,8 +1333,10 @@ async def ask_question(
 
         logger.info(
             "Completed /ask. total=%.0fms (understand=%.0fms) counter=%s session=%s",
-            processing_time, t_understand_ms,
-            retrieval_info["query_counter"]["value"], x_session_id
+            processing_time,
+            t_understand_ms,
+            retrieval_info["query_counter"]["value"],
+            x_session_id
         )
 
         return QuestionResponse(
