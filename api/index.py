@@ -71,7 +71,95 @@ counter_lock = threading.Lock()
 
 
 # -----------------------------
-# GEMINI QUERY UNDERSTANDING  (NEW - Step 1)
+# GREETING DETECTION  (NEW)
+# -----------------------------
+
+# Patterns that indicate a greeting / small-talk message
+_GREETING_PATTERNS = [
+    r"^\s*(hi|hello|hey|hiya|howdy|greetings|sup|what'?s up|yo)\b",
+    r"^\s*good\s*(morning|afternoon|evening|day)\b",
+    r"^\s*how\s+(are\s+you|r\s+u|do\s+you\s+do)\b",
+    r"^\s*(nice\s+to\s+meet|pleased\s+to\s+meet)\b",
+    r"^\s*(who\s+are\s+you|what\s+are\s+you)\b",
+    r"^\s*(thank(s|\s+you)|thx|cheers)\s*[!.]?\s*$",
+    r"^\s*bye\b",
+]
+
+_COMPILED_GREETING_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in _GREETING_PATTERNS
+]
+
+# Greeting responses — cycled (or randomly chosen) so repeated greetings
+# don't always get the same reply.
+_GREETING_RESPONSES = [
+    (
+        "⚽ Hello! I'm here to help you understand the beautiful game. "
+        "Ask me anything about the Laws of the Game — offside, fouls, "
+        "restarts, cards, or any other rule — and I'll give you a "
+        "precise, law-backed answer."
+    ),
+    (
+        "⚽ Hi there! I'm your Football Laws of the Game assistant. "
+        "Whether it's a tricky handball situation, a penalty-kick question, "
+        "or anything else from Laws 1–17, just ask and I'll look it up for you."
+    ),
+    (
+        "⚽ Hey! Ready to dive into football's rulebook? "
+        "I can answer questions about any of the 17 Laws of the Game — "
+        "go ahead and fire away!"
+    ),
+]
+
+# Lightweight check — does NOT call any LLM or retriever
+def is_greeting(text: str) -> bool:
+    """
+    Return True when the message appears to be a greeting / small-talk
+    rather than a substantive football-law question.
+
+    Heuristics used:
+    1. Matches a greeting regex pattern.
+    2. Very short message (≤ 4 words) with no question-mark and no
+       football-related keyword — catches bare "hi", "hello!", etc.
+    """
+    stripped = text.strip()
+
+    # Regex check
+    for pattern in _COMPILED_GREETING_PATTERNS:
+        if pattern.search(stripped):
+            return True
+
+    # Short-message fallback: ≤ 4 words AND no obvious football keyword
+    words = stripped.split()
+    if len(words) <= 4:
+        football_keywords = {
+            "offside", "foul", "penalty", "card", "goal", "kick",
+            "throw", "corner", "handball", "referee", "law", "laws",
+            "rule", "rules", "player", "goalkeeper", "substitute",
+            "red", "yellow", "var", "free", "direct", "indirect",
+            "ball", "pitch", "field", "match", "game",
+        }
+        lower_words = {w.lower().strip("?!.,") for w in words}
+        if not lower_words & football_keywords:
+            return True
+
+    return False
+
+
+def get_greeting_response(session_id: str) -> str:
+    """
+    Return a greeting response.  We derive a stable index from the
+    session_id so the same session always gets the same greeting
+    (feels more consistent) while different sessions get variety.
+    """
+    try:
+        idx = int(uuid.UUID(session_id).int) % len(_GREETING_RESPONSES)
+    except Exception:
+        idx = 0
+    return _GREETING_RESPONSES[idx]
+
+
+# -----------------------------
+# GEMINI QUERY UNDERSTANDING  (Step 1)
 # -----------------------------
 def understand_query(question: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
     """
@@ -465,7 +553,7 @@ class QuestionResponse(BaseModel):
     processing_time_ms: Optional[float] = None
     session_id: str
     conversation_context: Optional[List[ConversationContext]] = None
-    query_understanding: Optional[QueryUnderstanding] = None  # NEW – visible in response
+    query_understanding: Optional[QueryUnderstanding] = None  # visible in response
 
 
 class SessionResponse(BaseModel):
@@ -718,7 +806,7 @@ class HybridRetriever:
                 "dropped ball", "promising attack", "possession changes",
             ]
 
-        # Charging / physical challenges  (NEW)
+        # Charging / physical challenges
         if any(k in q for k in ["shoulder charge", "shoulder charged", "charging", "fair charge"]):
             law_boost.add(12)
             subsection_terms += ["fair charge", "physical challenge", "playing distance",
@@ -1112,7 +1200,8 @@ async def root():
         "improvements": [
             "Gemini query understanding step before retrieval",
             "Expanded synonym map (shoulder charge, diving, advantage, etc.)",
-            "Session-level context awareness for follow-up questions"
+            "Session-level context awareness for follow-up questions",
+            "Greeting detection — short-circuits RAG for small-talk messages"
         ],
         "storage": "MongoDB Atlas",
         "endpoints": {
@@ -1196,7 +1285,7 @@ async def get_stats():
 
 
 # -----------------------------------------------------------------------
-# /ask  – main endpoint (same interface as before, no frontend changes)
+# /ask  – main endpoint
 # -----------------------------------------------------------------------
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(
@@ -1223,6 +1312,43 @@ async def ask_question(
                 session = session_manager.get_session(x_session_id)
 
         conversation_history = session.get("conversation_history", []) if session else []
+
+        # ── GREETING DETECTION (short-circuit before any LLM/retriever call)
+        if is_greeting(request.question):
+            greeting_answer = get_greeting_response(x_session_id or "default")
+            processing_time = (time.time() - start) * 1000
+            logger.info(
+                "Greeting detected. Returning canned response. session=%s (%.0fms)",
+                x_session_id, processing_time
+            )
+            # NOTE: greetings are intentionally NOT stored in conversation
+            # history because they carry no football-law context.
+            return QuestionResponse(
+                question=request.question,
+                answer=greeting_answer,
+                evidence=[],
+                retrieval_info={
+                    "original_query": request.question,
+                    "rewritten_query": request.question,
+                    "query_understanding_ms": 0,
+                    "boosted_laws": [],
+                    "scenario_context": {},
+                    "chunks_retrieved": 0,
+                    "context_aware": False,
+                    "is_follow_up": False,
+                    "greeting_detected": True,        # handy flag for the frontend
+                    "query_counter": {
+                        "value": 0,
+                        "persisted": False,
+                        "storage": "none",
+                        "note": "Greetings are not counted"
+                    }
+                },
+                processing_time_ms=processing_time,
+                session_id=x_session_id or "none",
+                conversation_context=None,
+                query_understanding=None,
+            )
 
         # ── Follow-up detection ────────────────────────────────────────
         context_info = detect_follow_up_question(request.question, conversation_history)
@@ -1297,7 +1423,8 @@ async def ask_question(
             "scenario_context": scenario,
             "chunks_retrieved": len(top_chunks),
             "context_aware": context_info is not None,
-            "is_follow_up": context_info.get("is_follow_up", False) if context_info else False
+            "is_follow_up": context_info.get("is_follow_up", False) if context_info else False,
+            "greeting_detected": False,
         }
 
         processing_time = (time.time() - start) * 1000
